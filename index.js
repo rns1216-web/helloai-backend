@@ -18,6 +18,10 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
+// Optional: Google Custom Search API for Evidence
+const GOOGLE_SEARCH_API_KEY = process.env.GOOGLE_SEARCH_API_KEY;
+const GOOGLE_SEARCH_CX = process.env.GOOGLE_SEARCH_CX;
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -305,10 +309,12 @@ app.post("/agent_smith", async (req, res) => {
 });
 
 // --------------------------------------------------
-// EVIDENCE SEARCH ENDPOINT (NEW)
+// EVIDENCE SEARCH ENDPOINT (UPDATED)
 // Expects: { query: string }
 // Returns: { results: EvidenceItem[] }
 // Evidence is independent of Agent Smith answers.
+// Tries Google Custom Search first (if configured),
+// falls back to DuckDuckGo HTML parsing otherwise.
 // --------------------------------------------------
 app.post("/evidence_search", async (req, res) => {
   try {
@@ -324,7 +330,68 @@ app.post("/evidence_search", async (req, res) => {
     const q = query.trim();
     console.log("🔎 /evidence_search query:", q);
 
-    // DuckDuckGo HTML results (no API key)
+    // --------------------------------------------------
+    // 1) Try GOOGLE CUSTOM SEARCH if configured
+    // --------------------------------------------------
+    if (GOOGLE_SEARCH_API_KEY && GOOGLE_SEARCH_CX) {
+      try {
+        const url = new URL("https://www.googleapis.com/customsearch/v1");
+        url.searchParams.set("key", GOOGLE_SEARCH_API_KEY);
+        url.searchParams.set("cx", GOOGLE_SEARCH_CX);
+        url.searchParams.set("q", q);
+
+        const resp = await fetch(url, {
+          method: "GET"
+        });
+
+        if (!resp.ok) {
+          console.error(
+            "❌ Google CSE fetch failed:",
+            resp.status,
+            resp.statusText
+          );
+        } else {
+          const data = await resp.json();
+          const items = Array.isArray(data.items) ? data.items : [];
+
+          const results = items.slice(0, 3).map((item) => {
+            const title = safeString(item.title);
+            const url = safeString(item.link);
+            const snippet = safeString(item.snippet);
+            const displayLink = safeString(item.displayLink);
+            const domain = extractDomain(url);
+            const source = displayLink || domain || null;
+
+            return {
+              title,
+              source,
+              date: null, // Google CSE doesn't always give a clean date field
+              url,
+              snippet: snippet || "No snippet available.",
+              credibilityScore: credibilityScoreFor(url, source)
+            };
+          });
+
+          console.log(
+            "✅ /evidence_search (Google) results:",
+            results.length
+          );
+
+          return res.json({ results });
+        }
+      } catch (err) {
+        console.error("❌ Google CSE error:", err);
+        // fall through to DDG fallback below
+      }
+    } else {
+      console.log(
+        "ℹ️ Google Custom Search not configured; using DuckDuckGo fallback."
+      );
+    }
+
+    // --------------------------------------------------
+    // 2) DUCKDUCKGO FALLBACK (existing behavior)
+    // --------------------------------------------------
     const ddgUrl = `https://duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
 
     const resp = await fetch(ddgUrl, {
@@ -354,6 +421,8 @@ app.post("/evidence_search", async (req, res) => {
         credibilityScore: credibilityScoreFor(r.url, source)
       };
     });
+
+    console.log("✅ /evidence_search (DDG) results:", results.length);
 
     return res.json({ results });
 
