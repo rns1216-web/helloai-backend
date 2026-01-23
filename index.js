@@ -109,7 +109,8 @@ function credibilityScoreFor(url, source) {
 }
 
 // Pull top DDG results from HTML (no API key).
-// NOTE: DDG HTML markup can change; this is intentionally defensive.
+// NOTE: We no longer rely on this (JSON API is preferred),
+// but it's kept here in case you want to experiment later.
 function parseDuckDuckGoHtml(html) {
   const out = [];
   const text = safeString(html);
@@ -120,7 +121,8 @@ function parseDuckDuckGoHtml(html) {
   // - inner text of that anchor (title)
   // - snippet from <a class="result__snippet"> or <div class="result__snippet">
   const linkRegex = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-  const snippetRegex = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>|<div[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/div>/g;
+  const snippetRegex =
+    /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>|<div[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/div>/g;
 
   const links = [];
   let m;
@@ -191,10 +193,11 @@ app.post("/generate", async (req, res) => {
     console.log("📤 Output length:", output.length);
 
     return res.json({ result: output });
-
   } catch (err) {
     console.error("❌ /generate failed:", err);
-    return res.status(500).json({ error: "AI generation failed", details: err.message });
+    return res
+      .status(500)
+      .json({ error: "AI generation failed", details: err.message });
   }
 });
 
@@ -249,9 +252,11 @@ app.post("/agent_smith", async (req, res) => {
     }
 
     // Minimal normalization (protect Android parser)
-    if (!Array.isArray(parsed.answer)) parsed.answer = [String(parsed.answer || "No answer.")];
+    if (!Array.isArray(parsed.answer))
+      parsed.answer = [String(parsed.answer || "No answer.")];
     if (!Array.isArray(parsed.evidence)) parsed.evidence = [];
-    if (!Array.isArray(parsed.assumptionsAndUnknowns)) parsed.assumptionsAndUnknowns = [];
+    if (!Array.isArray(parsed.assumptionsAndUnknowns))
+      parsed.assumptionsAndUnknowns = [];
     if (!Array.isArray(parsed.warnings)) parsed.warnings = [];
     if (typeof parsed.confidence !== "number") parsed.confidence = 60;
     if (!parsed.stoplight) parsed.stoplight = "YELLOW";
@@ -297,7 +302,6 @@ app.post("/agent_smith", async (req, res) => {
     parsed.stoplight = s === "GREEN" || s === "RED" ? s : "YELLOW";
 
     return res.json(parsed);
-
   } catch (err) {
     console.error("❌ /agent_smith failed:", err);
     return res.status(500).json({
@@ -309,12 +313,12 @@ app.post("/agent_smith", async (req, res) => {
 });
 
 // --------------------------------------------------
-// EVIDENCE SEARCH ENDPOINT (UPDATED)
+// EVIDENCE SEARCH ENDPOINT (UPDATED, DDG JSON)
 // Expects: { query: string }
 // Returns: { results: EvidenceItem[] }
 // Evidence is independent of Agent Smith answers.
 // Tries Google Custom Search first (if configured),
-// falls back to DuckDuckGo HTML parsing otherwise.
+// falls back to DuckDuckGo JSON API otherwise.
 // --------------------------------------------------
 app.post("/evidence_search", async (req, res) => {
   try {
@@ -340,9 +344,7 @@ app.post("/evidence_search", async (req, res) => {
         url.searchParams.set("cx", GOOGLE_SEARCH_CX);
         url.searchParams.set("q", q);
 
-        const resp = await fetch(url, {
-          method: "GET"
-        });
+        const resp = await fetch(url, { method: "GET" });
 
         if (!resp.ok) {
           console.error(
@@ -372,60 +374,90 @@ app.post("/evidence_search", async (req, res) => {
             };
           });
 
-          console.log(
-            "✅ /evidence_search (Google) results:",
-            results.length
-          );
-
+          console.log("✅ /evidence_search (Google) results:", results.length);
           return res.json({ results });
         }
       } catch (err) {
         console.error("❌ Google CSE error:", err);
-        // fall through to DDG fallback below
+        // fall through to DDG JSON fallback below
       }
     } else {
       console.log(
-        "ℹ️ Google Custom Search not configured; using DuckDuckGo fallback."
+        "ℹ️ Google Custom Search not configured; using DuckDuckGo JSON fallback."
       );
     }
 
     // --------------------------------------------------
-    // 2) DUCKDUCKGO FALLBACK (existing behavior)
+    // 2) DUCKDUCKGO JSON FALLBACK (NO KEY, STABLE)
     // --------------------------------------------------
-    const ddgUrl = `https://duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
+    const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(
+      q
+    )}&format=json&no_redirect=1&no_html=1`;
 
-    const resp = await fetch(ddgUrl, {
-      method: "GET",
-      headers: {
-        // simple UA to reduce bot-blocking
-        "User-Agent": "HelloAI-EvidenceBot/1.0"
-      }
-    });
+    const resp = await fetch(ddgUrl, { method: "GET" });
 
     if (!resp.ok) {
-      console.error("❌ DDG fetch failed:", resp.status, resp.statusText);
+      console.error("❌ DDG JSON fetch failed:", resp.status, resp.statusText);
       return res.json({ results: [] });
     }
 
-    const html = await resp.text();
-    const parsed = parseDuckDuckGoHtml(html).slice(0, 3);
+    const data = await resp.json();
+
+    // Helper to flatten DDG JSON structure into simple items
+    function parseDuckDuckGoJson(json) {
+      const out = [];
+
+      // 1) Abstract (if present)
+      if (safeString(json.AbstractURL) && safeString(json.AbstractText)) {
+        out.push({
+          title: safeString(json.Heading) || safeString(json.AbstractText),
+          url: safeString(json.AbstractURL),
+          snippet: safeString(json.AbstractText)
+        });
+      }
+
+      // 2) RelatedTopics (top-level & nested)
+      function pushTopics(topics) {
+        if (!Array.isArray(topics)) return;
+        for (const t of topics) {
+          if (t && typeof t === "object") {
+            if (t.FirstURL && t.Text) {
+              out.push({
+                title: safeString(t.Text.split(" - ")[0]),
+                url: safeString(t.FirstURL),
+                snippet: safeString(t.Text)
+              });
+            }
+            if (Array.isArray(t.Topics)) {
+              pushTopics(t.Topics);
+            }
+          }
+        }
+      }
+
+      pushTopics(json.RelatedTopics || []);
+      return out;
+    }
+
+    const parsed = parseDuckDuckGoJson(data).slice(0, 3);
 
     const results = parsed.map((r) => {
-      const source = r.domain ? r.domain.split(".").slice(-2).join(".") : null; // fallback source
+      const url = r.url;
+      const domain = extractDomain(url);
+      const source = domain || null;
+
       return {
-        title: r.title,
-        source: source,
-        date: null, // DDG doesn’t reliably provide dates; Phase 3b can enrich later
-        url: r.url,
-        snippet: r.snippet,
-        credibilityScore: credibilityScoreFor(r.url, source)
+        title: r.title || r.snippet || url || "Untitled",
+        source,
+        date: null,
+        url,
+        snippet: r.snippet || "No snippet available.",
+        credibilityScore: credibilityScoreFor(url, source)
       };
     });
 
-    console.log("✅ /evidence_search (DDG) results:", results.length);
-
+    console.log("✅ /evidence_search (DDG JSON) results:", results.length);
     return res.json({ results });
-
   } catch (err) {
     console.error("❌ /evidence_search failed:", err);
     return res.status(500).json({
