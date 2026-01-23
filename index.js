@@ -254,6 +254,40 @@ app.post("/agent_smith", async (req, res) => {
     if (!Array.isArray(parsed.violationTags)) parsed.violationTags = [];
     if (typeof parsed.attemptsUsed !== "number") parsed.attemptsUsed = 1;
 
+    // ✅ NEW: normalize evidence items (Phase 3b-ready: snippet + credibilityScore optional)
+    parsed.evidence = (parsed.evidence || [])
+      .filter(Boolean)
+      .map((ev) => {
+        const title = typeof ev.title === "string" ? ev.title.trim() : "";
+        const source = typeof ev.source === "string" ? ev.source.trim() : "";
+        const date = typeof ev.date === "string" ? ev.date.trim() : "";
+        const url = typeof ev.url === "string" ? ev.url.trim() : "";
+
+        const snippet =
+          typeof ev.snippet === "string" && ev.snippet.trim().length
+            ? ev.snippet.trim()
+            : undefined;
+
+        const credibilityScoreRaw = ev.credibilityScore;
+        const credibilityScore =
+          typeof credibilityScoreRaw === "number" && Number.isFinite(credibilityScoreRaw)
+            ? Math.max(0, Math.min(100, Math.round(credibilityScoreRaw)))
+            : undefined;
+
+        const out = {
+          title,
+          source: source || undefined,
+          date: date || undefined,
+          url: url || undefined
+        };
+
+        if (snippet !== undefined) out.snippet = snippet;
+        if (credibilityScore !== undefined) out.credibilityScore = credibilityScore;
+
+        return out;
+      })
+      .filter((ev) => ev.title && ev.title.length);
+
     // Ensure stoplight is one of GREEN/YELLOW/RED
     const s = String(parsed.stoplight).toUpperCase();
     parsed.stoplight = s === "GREEN" || s === "RED" ? s : "YELLOW";
