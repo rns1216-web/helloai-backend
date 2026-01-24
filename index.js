@@ -298,13 +298,17 @@ app.post("/evidence_search", async (req, res) => {
       const domain = extractDomain(link);
       const source = domain || null;
 
+      // ✅ Step 1: Pass through favicon when SerpApi provides it
+      const favicon = safeString(item.favicon || item.favicon_url || item.faviconUrl);
+
       return {
         title: title || link || "Untitled",
         source,
         date: null,
         url: link || null,
         snippet: snippet || "No snippet available.",
-        credibilityScore: credibilityScoreFor(link, source)
+        credibilityScore: credibilityScoreFor(link, source),
+        favicon: favicon || null
       };
     });
 
@@ -316,7 +320,8 @@ app.post("/evidence_search", async (req, res) => {
         date: null,
         url: `https://duckduckgo.com/?q=${encodeURIComponent(q)}`,
         snippet: "Open the full DuckDuckGo results page for this question in your browser.",
-        credibilityScore: 78
+        credibilityScore: 78,
+        favicon: null
       });
     }
 
