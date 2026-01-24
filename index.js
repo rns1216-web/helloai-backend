@@ -313,12 +313,10 @@ app.post("/agent_smith", async (req, res) => {
 });
 
 // --------------------------------------------------
-// EVIDENCE SEARCH ENDPOINT (UPDATED, DDG JSON)
+// EVIDENCE SEARCH ENDPOINT (UPDATED, GOOGLE + DDG JSON)
 // Expects: { query: string }
 // Returns: { results: EvidenceItem[] }
 // Evidence is independent of Agent Smith answers.
-// Tries Google Custom Search first (if configured),
-// falls back to DuckDuckGo JSON API otherwise.
 // --------------------------------------------------
 app.post("/evidence_search", async (req, res) => {
   try {
@@ -333,6 +331,12 @@ app.post("/evidence_search", async (req, res) => {
 
     const q = query.trim();
     console.log("🔎 /evidence_search query:", q);
+    console.log(
+      "   Google keys present? API:",
+      !!GOOGLE_SEARCH_API_KEY,
+      "CX:",
+      !!GOOGLE_SEARCH_CX
+    );
 
     // --------------------------------------------------
     // 1) Try GOOGLE CUSTOM SEARCH if configured
@@ -356,7 +360,7 @@ app.post("/evidence_search", async (req, res) => {
           const data = await resp.json();
           const items = Array.isArray(data.items) ? data.items : [];
 
-          const results = items.slice(0, 3).map((item) => {
+          const gResults = items.slice(0, 3).map((item) => {
             const title = safeString(item.title);
             const url = safeString(item.link);
             const snippet = safeString(item.snippet);
@@ -374,8 +378,12 @@ app.post("/evidence_search", async (req, res) => {
             };
           });
 
-          console.log("✅ /evidence_search (Google) results:", results.length);
-          return res.json({ results });
+          console.log("✅ /evidence_search (Google) results:", gResults.length);
+
+          if (gResults.length > 0) {
+            return res.json({ results: gResults });
+          }
+          // If Google returned nothing useful, fall through to DDG JSON.
         }
       } catch (err) {
         console.error("❌ Google CSE error:", err);
@@ -441,7 +449,7 @@ app.post("/evidence_search", async (req, res) => {
 
     const parsed = parseDuckDuckGoJson(data).slice(0, 3);
 
-    const results = parsed.map((r) => {
+    let results = parsed.map((r) => {
       const url = r.url;
       const domain = extractDomain(url);
       const source = domain || null;
@@ -455,6 +463,20 @@ app.post("/evidence_search", async (req, res) => {
         credibilityScore: credibilityScoreFor(url, source)
       };
     });
+
+    // 🔁 Fallback: if we STILL have no structured results,
+    // at least give the user a direct Google search link.
+    if (!results.length) {
+      results.push({
+        title: `View Google results for: ${q}`,
+        source: "google.com",
+        date: null,
+        url: `https://www.google.com/search?q=${encodeURIComponent(q)}`,
+        snippet:
+          "Open the full Google search results page for this question in your browser.",
+        credibilityScore: 86
+      });
+    }
 
     console.log("✅ /evidence_search (DDG JSON) results:", results.length);
     return res.json({ results });
