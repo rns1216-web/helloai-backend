@@ -1,4 +1,4 @@
-// index.js — HelloAI Backend (Full Working Version + Agent Smith + Evidence Search)
+// index.js — HelloAI Backend (Full Working Version + Agent Smith + Evidence Search via SerpApi DuckDuckGo)
 
 const express = require("express");
 const cors = require("cors");
@@ -8,19 +8,18 @@ const { OpenAI } = require("openai");
 // Load .env variables
 dotenv.config();
 
-// Ensure API key exists
+// Ensure OpenAI key exists
 if (!process.env.OPENAI_API_KEY) {
   console.error("❌ Missing OPENAI_API_KEY in .env");
   process.exit(1);
 }
 
+// SerpApi (DuckDuckGo) key for Evidence Search
+const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY;
+
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
-
-// Optional: Google Custom Search API for Evidence
-const GOOGLE_SEARCH_API_KEY = process.env.GOOGLE_SEARCH_API_KEY;
-const GOOGLE_SEARCH_CX = process.env.GOOGLE_SEARCH_CX;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -65,7 +64,6 @@ function credibilityScoreFor(url, source) {
   const d = (extractDomain(url) || "").toLowerCase();
   const s = (safeString(source) || "").toLowerCase();
 
-  // High-ish credibility defaults for well-known domains/sources
   const high = [
     "reuters.com",
     "apnews.com",
@@ -100,63 +98,8 @@ function credibilityScoreFor(url, source) {
 
   if (high.includes(d)) return 86;
   if (mid.includes(d)) return 78;
-
-  // if we at least have a real domain, give a neutral mid score
   if (d) return 72;
-
-  // unknown
   return 60;
-}
-
-// Pull top DDG results from HTML (no API key).
-// NOTE: We no longer rely on this (JSON API is preferred),
-// but it's kept here in case you want to experiment later.
-function parseDuckDuckGoHtml(html) {
-  const out = [];
-  const text = safeString(html);
-
-  // Match blocks that contain result links and snippets
-  // We try to capture:
-  // - href from <a class="result__a" href="...">
-  // - inner text of that anchor (title)
-  // - snippet from <a class="result__snippet"> or <div class="result__snippet">
-  const linkRegex = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-  const snippetRegex =
-    /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>|<div[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/div>/g;
-
-  const links = [];
-  let m;
-  while ((m = linkRegex.exec(text)) !== null) {
-    const href = decodeHtmlEntities(m[1]);
-    const titleHtml = m[2];
-    const title = decodeHtmlEntities(stripTags(titleHtml));
-    if (href && title) links.push({ href, title });
-    if (links.length >= 10) break;
-  }
-
-  const snippets = [];
-  let s;
-  while ((s = snippetRegex.exec(text)) !== null) {
-    const sn = decodeHtmlEntities(stripTags(s[1] || s[2] || ""));
-    if (sn) snippets.push(sn);
-    if (snippets.length >= 10) break;
-  }
-
-  // Pair by index (best-effort)
-  for (let i = 0; i < links.length; i++) {
-    const url = links[i].href;
-    const title = links[i].title;
-    const domain = extractDomain(url);
-    const snippet = snippets[i] || "No snippet available.";
-    out.push({
-      title,
-      url,
-      domain,
-      snippet
-    });
-  }
-
-  return out;
 }
 
 // --------------------------------------------------
@@ -179,7 +122,6 @@ app.post("/generate", async (req, res) => {
 
     console.log("📩 Incoming prompt:", prompt.substring(0, 200) + "...");
 
-    // Call OpenAI
     const completion = await client.chat.completions.create({
       model: "gpt-4.1-mini",
       messages: [
@@ -189,15 +131,12 @@ app.post("/generate", async (req, res) => {
     });
 
     const output = completion.choices?.[0]?.message?.content || "";
-
     console.log("📤 Output length:", output.length);
 
     return res.json({ result: output });
   } catch (err) {
     console.error("❌ /generate failed:", err);
-    return res
-      .status(500)
-      .json({ error: "AI generation failed", details: err.message });
+    return res.status(500).json({ error: "AI generation failed", details: err.message });
   }
 });
 
@@ -223,8 +162,6 @@ app.post("/agent_smith", async (req, res) => {
       model: "gpt-4.1-mini",
       temperature: 0.2,
       messages: [
-        // IMPORTANT: your Android sends a fully-built contract in prompt,
-        // so keep this role simple and non-conflicting.
         { role: "system", content: "Return ONLY valid JSON. No markdown. No extra text." },
         { role: "user", content: prompt }
       ]
@@ -233,12 +170,10 @@ app.post("/agent_smith", async (req, res) => {
     const raw = completion.choices?.[0]?.message?.content || "";
     console.log("🧾 /agent_smith raw length:", raw.length);
 
-    // Try parse JSON (model should output strict JSON)
     let parsed;
     try {
       parsed = JSON.parse(raw);
     } catch (e) {
-      // Safe fallback JSON for the app
       parsed = {
         answer: [raw || "Model returned empty output."],
         evidence: [],
@@ -251,19 +186,15 @@ app.post("/agent_smith", async (req, res) => {
       };
     }
 
-    // Minimal normalization (protect Android parser)
-    if (!Array.isArray(parsed.answer))
-      parsed.answer = [String(parsed.answer || "No answer.")];
+    if (!Array.isArray(parsed.answer)) parsed.answer = [String(parsed.answer || "No answer.")];
     if (!Array.isArray(parsed.evidence)) parsed.evidence = [];
-    if (!Array.isArray(parsed.assumptionsAndUnknowns))
-      parsed.assumptionsAndUnknowns = [];
+    if (!Array.isArray(parsed.assumptionsAndUnknowns)) parsed.assumptionsAndUnknowns = [];
     if (!Array.isArray(parsed.warnings)) parsed.warnings = [];
     if (typeof parsed.confidence !== "number") parsed.confidence = 60;
     if (!parsed.stoplight) parsed.stoplight = "YELLOW";
     if (!Array.isArray(parsed.violationTags)) parsed.violationTags = [];
     if (typeof parsed.attemptsUsed !== "number") parsed.attemptsUsed = 1;
 
-    // ✅ NEW: normalize evidence items (Phase 3b-ready: snippet + credibilityScore optional)
     parsed.evidence = (parsed.evidence || [])
       .filter(Boolean)
       .map((ev) => {
@@ -273,9 +204,7 @@ app.post("/agent_smith", async (req, res) => {
         const url = typeof ev.url === "string" ? ev.url.trim() : "";
 
         const snippet =
-          typeof ev.snippet === "string" && ev.snippet.trim().length
-            ? ev.snippet.trim()
-            : undefined;
+          typeof ev.snippet === "string" && ev.snippet.trim().length ? ev.snippet.trim() : undefined;
 
         const credibilityScoreRaw = ev.credibilityScore;
         const credibilityScore =
@@ -297,7 +226,6 @@ app.post("/agent_smith", async (req, res) => {
       })
       .filter((ev) => ev.title && ev.title.length);
 
-    // Ensure stoplight is one of GREEN/YELLOW/RED
     const s = String(parsed.stoplight).toUpperCase();
     parsed.stoplight = s === "GREEN" || s === "RED" ? s : "YELLOW";
 
@@ -313,10 +241,9 @@ app.post("/agent_smith", async (req, res) => {
 });
 
 // --------------------------------------------------
-// EVIDENCE SEARCH ENDPOINT (UPDATED, GOOGLE + DDG JSON)
+// EVIDENCE SEARCH ENDPOINT (SerpApi DuckDuckGo)
 // Expects: { query: string }
 // Returns: { results: EvidenceItem[] }
-// Evidence is independent of Agent Smith answers.
 // --------------------------------------------------
 app.post("/evidence_search", async (req, res) => {
   try {
@@ -331,154 +258,69 @@ app.post("/evidence_search", async (req, res) => {
 
     const q = query.trim();
     console.log("🔎 /evidence_search query:", q);
-    console.log(
-      "   Google keys present? API:",
-      !!GOOGLE_SEARCH_API_KEY,
-      "CX:",
-      !!GOOGLE_SEARCH_CX
-    );
+    console.log("   SerpApi key present?", !!SERPAPI_API_KEY);
 
-    // --------------------------------------------------
-    // 1) Try GOOGLE CUSTOM SEARCH if configured
-    // --------------------------------------------------
-    if (GOOGLE_SEARCH_API_KEY && GOOGLE_SEARCH_CX) {
-      try {
-        const url = new URL("https://www.googleapis.com/customsearch/v1");
-        url.searchParams.set("key", GOOGLE_SEARCH_API_KEY);
-        url.searchParams.set("cx", GOOGLE_SEARCH_CX);
-        url.searchParams.set("q", q);
-
-        const resp = await fetch(url, { method: "GET" });
-
-        if (!resp.ok) {
-          console.error(
-            "❌ Google CSE fetch failed:",
-            resp.status,
-            resp.statusText
-          );
-        } else {
-          const data = await resp.json();
-          const items = Array.isArray(data.items) ? data.items : [];
-
-          const gResults = items.slice(0, 3).map((item) => {
-            const title = safeString(item.title);
-            const url = safeString(item.link);
-            const snippet = safeString(item.snippet);
-            const displayLink = safeString(item.displayLink);
-            const domain = extractDomain(url);
-            const source = displayLink || domain || null;
-
-            return {
-              title,
-              source,
-              date: null, // Google CSE doesn't always give a clean date field
-              url,
-              snippet: snippet || "No snippet available.",
-              credibilityScore: credibilityScoreFor(url, source)
-            };
-          });
-
-          console.log("✅ /evidence_search (Google) results:", gResults.length);
-
-          if (gResults.length > 0) {
-            return res.json({ results: gResults });
-          }
-          // If Google returned nothing useful, fall through to DDG JSON.
-        }
-      } catch (err) {
-        console.error("❌ Google CSE error:", err);
-        // fall through to DDG JSON fallback below
-      }
-    } else {
-      console.log(
-        "ℹ️ Google Custom Search not configured; using DuckDuckGo JSON fallback."
-      );
+    if (!SERPAPI_API_KEY) {
+      return res.status(500).json({
+        error: true,
+        message: "Missing SERPAPI_API_KEY in environment (.env / Render).",
+        results: []
+      });
     }
 
-    // --------------------------------------------------
-    // 2) DUCKDUCKGO JSON FALLBACK (NO KEY, STABLE)
-    // --------------------------------------------------
-    const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(
-      q
-    )}&format=json&no_redirect=1&no_html=1`;
+    const url = new URL("https://serpapi.com/search.json");
+    url.searchParams.set("engine", "duckduckgo");
+    url.searchParams.set("q", q);
+    url.searchParams.set("api_key", SERPAPI_API_KEY);
+    url.searchParams.set("no_cache", "true"); // helpful during dev
 
-    const resp = await fetch(ddgUrl, { method: "GET" });
+    const resp = await fetch(url, { method: "GET" });
 
     if (!resp.ok) {
-      console.error("❌ DDG JSON fetch failed:", resp.status, resp.statusText);
-      return res.json({ results: [] });
+      const bodyText = await resp.text().catch(() => "");
+      console.error("❌ SerpApi fetch failed:", resp.status, resp.statusText, bodyText);
+      return res.status(500).json({
+        error: true,
+        message: "Evidence search failed (SerpApi error).",
+        details: `${resp.status} ${resp.statusText}`,
+        results: []
+      });
     }
 
     const data = await resp.json();
 
-    // Helper to flatten DDG JSON structure into simple items
-    function parseDuckDuckGoJson(json) {
-      const out = [];
+    const organic = Array.isArray(data.organic_results) ? data.organic_results : [];
+    let results = organic.slice(0, 3).map((item) => {
+      const title = safeString(item.title);
+      const link = safeString(item.link || item.url); // some engines vary
+      const snippet = safeString(item.snippet);
 
-      // 1) Abstract (if present)
-      if (safeString(json.AbstractURL) && safeString(json.AbstractText)) {
-        out.push({
-          title: safeString(json.Heading) || safeString(json.AbstractText),
-          url: safeString(json.AbstractURL),
-          snippet: safeString(json.AbstractText)
-        });
-      }
-
-      // 2) RelatedTopics (top-level & nested)
-      function pushTopics(topics) {
-        if (!Array.isArray(topics)) return;
-        for (const t of topics) {
-          if (t && typeof t === "object") {
-            if (t.FirstURL && t.Text) {
-              out.push({
-                title: safeString(t.Text.split(" - ")[0]),
-                url: safeString(t.FirstURL),
-                snippet: safeString(t.Text)
-              });
-            }
-            if (Array.isArray(t.Topics)) {
-              pushTopics(t.Topics);
-            }
-          }
-        }
-      }
-
-      pushTopics(json.RelatedTopics || []);
-      return out;
-    }
-
-    const parsed = parseDuckDuckGoJson(data).slice(0, 3);
-
-    let results = parsed.map((r) => {
-      const url = r.url;
-      const domain = extractDomain(url);
+      const domain = extractDomain(link);
       const source = domain || null;
 
       return {
-        title: r.title || r.snippet || url || "Untitled",
+        title: title || link || "Untitled",
         source,
         date: null,
-        url,
-        snippet: r.snippet || "No snippet available.",
-        credibilityScore: credibilityScoreFor(url, source)
+        url: link || null,
+        snippet: snippet || "No snippet available.",
+        credibilityScore: credibilityScoreFor(link, source)
       };
     });
 
-    // 🔁 Fallback: if we STILL have no structured results,
-    // at least give the user a direct Google search link.
+    // If empty, at least return a direct DDG search link
     if (!results.length) {
       results.push({
-        title: `View Google results for: ${q}`,
-        source: "google.com",
+        title: `View DuckDuckGo results for: ${q}`,
+        source: "duckduckgo.com",
         date: null,
-        url: `https://www.google.com/search?q=${encodeURIComponent(q)}`,
-        snippet:
-          "Open the full Google search results page for this question in your browser.",
-        credibilityScore: 86
+        url: `https://duckduckgo.com/?q=${encodeURIComponent(q)}`,
+        snippet: "Open the full DuckDuckGo results page for this question in your browser.",
+        credibilityScore: 78
       });
     }
 
-    console.log("✅ /evidence_search (DDG JSON) results:", results.length);
+    console.log("✅ /evidence_search (SerpApi DDG) results:", results.length);
     return res.json({ results });
   } catch (err) {
     console.error("❌ /evidence_search failed:", err);
