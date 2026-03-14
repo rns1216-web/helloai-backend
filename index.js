@@ -65,6 +65,22 @@ function normalizePlaceQuery(text) {
   return safeString(text).replace(/\s+/g, " ").trim();
 }
 
+function normalizeComparableText(text) {
+  return normalizePlaceQuery(text)
+    .toLowerCase()
+    .replace(/[’']/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeComparableText(text) {
+  return normalizeComparableText(text)
+    .split(" ")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
 function buildHereDisplayNames(item) {
   const title = safeString(item?.title).trim() || safeString(item?.address?.label).trim() || "Unknown place";
   const address = item?.address || {};
@@ -78,8 +94,212 @@ function buildHereDisplayNames(item) {
   };
 }
 
-async function geocodeSingleWithHere(rawQuery) {
+function getHereAddressBits(item) {
+  const address = item?.address || {};
+  return {
+    city: safeString(address.city || address.county || address.district).trim(),
+    stateCode: safeString(address.stateCode).trim(),
+    state: safeString(address.state).trim(),
+    countryCode: safeString(address.countryCode).trim(),
+    countryName: safeString(address.countryName).trim()
+  };
+}
+
+function haversineMiles(lat1, lng1, lat2, lng2) {
+  if (
+    typeof lat1 !== "number" ||
+    typeof lng1 !== "number" ||
+    typeof lat2 !== "number" ||
+    typeof lng2 !== "number"
+  ) {
+    return null;
+  }
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 3958.7613;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function inferAnchorContext(start, end) {
+  const a = start?.resolved ? start : null;
+  const b = end?.resolved ? end : null;
+  if (!a && !b) return null;
+
+  const sameCountry =
+    a && b &&
+    a.countryCode &&
+    b.countryCode &&
+    normalizeComparableText(a.countryCode) === normalizeComparableText(b.countryCode);
+
+  const sameState =
+    a && b &&
+    sameCountry &&
+    (
+      (a.stateCode && b.stateCode && normalizeComparableText(a.stateCode) === normalizeComparableText(b.stateCode)) ||
+      (a.state && b.state && normalizeComparableText(a.state) === normalizeComparableText(b.state))
+    );
+
+  const sameCity =
+    a && b &&
+    sameCountry &&
+    a.city &&
+    b.city &&
+    normalizeComparableText(a.city) === normalizeComparableText(b.city);
+
+  const primary = a || b;
+  const secondary = b || a;
+
+  return {
+    city: (sameCity && (a?.city || b?.city)) || primary?.city || secondary?.city || "",
+    stateCode: (sameState && (a?.stateCode || b?.stateCode)) || primary?.stateCode || secondary?.stateCode || "",
+    state: (sameState && (a?.state || b?.state)) || primary?.state || secondary?.state || "",
+    countryCode: primary?.countryCode || secondary?.countryCode || "",
+    countryName: primary?.countryName || secondary?.countryName || "",
+    lat: primary?.lat,
+    lng: primary?.lng
+  };
+}
+
+function applyRouteAlias(rawQuery, anchor) {
+  const q = normalizePlaceQuery(rawQuery);
+  const lower = normalizeComparableText(q);
+  const anchorCity = normalizeComparableText(anchor?.city || "");
+  const isChicago = anchorCity === "chicago";
+
+  const exactMap = {
+    "art institute": isChicago ? "Art Institute of Chicago" : q,
+    "the bean": isChicago ? "Cloud Gate" : q,
+    "union station east door": isChicago ? "Chicago Union Station East Entrance" : q,
+    "union station-east door": isChicago ? "Chicago Union Station East Entrance" : q,
+    "riverwalk": isChicago ? "Chicago Riverwalk" : q,
+    "chicago riverwalk": "Chicago Riverwalk"
+  };
+
+  if (exactMap[lower]) return exactMap[lower];
+
+  if (isChicago) {
+    if (lower in {"aquarium": 1, "shedd": 1, "shedd aquarium": 1}) return "Shedd Aquarium";
+    if (lower in {"lincoln park": 1}) return "Lincoln Park Chicago";
+    if (lower in {"portillos": 1, "portillos chicago": 1, "portillo's": 1, "portillos restaurant": 1}) return "Portillo's Chicago";
+  }
+
+  return q;
+}
+
+function buildQueryVariants(rawQuery, anchor) {
+  const base = applyRouteAlias(rawQuery, anchor);
+  const variants = [];
+  const pushVariant = (x) => {
+    const v = normalizePlaceQuery(x);
+    if (!v) return;
+    if (!variants.some((existing) => normalizeComparableText(existing) === normalizeComparableText(v))) {
+      variants.push(v);
+    }
+  };
+
+  pushVariant(rawQuery);
+  pushVariant(base);
+
+  if (anchor?.city) {
+    if (anchor?.stateCode) {
+      pushVariant(`${base}, ${anchor.city}, ${anchor.stateCode}`);
+    }
+    if (anchor?.state) {
+      pushVariant(`${base}, ${anchor.city}, ${anchor.state}`);
+    }
+    pushVariant(`${base}, ${anchor.city}`);
+  }
+
+  if (anchor?.countryCode) {
+    pushVariant(`${base}, ${anchor.countryCode}`);
+  }
+
+  return variants.slice(0, 5);
+}
+
+async function fetchHereGeocodeCandidates(query, limit = 5) {
+  if (!HERE_API_KEY) {
+    throw new Error("Missing HERE_API_KEY in environment.");
+  }
+  const url =
+    `https://geocode.search.hereapi.com/v1/geocode?q=${encodeURIComponent(query)}` +
+    `&limit=${encodeURIComponent(String(limit))}` +
+    `&apiKey=${encodeURIComponent(HERE_API_KEY)}`;
+
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`HERE geocode failed with status ${response.status}`);
+  }
+  const data = await response.json();
+  return Array.isArray(data.items) ? data.items : [];
+}
+
+function scoreHereCandidate(item, rawQuery, queryVariant, anchor) {
+  const names = buildHereDisplayNames(item);
+  const bits = getHereAddressBits(item);
+  const titleNorm = normalizeComparableText(names.shortName);
+  const rawNorm = normalizeComparableText(rawQuery);
+  const queryNorm = normalizeComparableText(queryVariant);
+
+  const titleTokens = new Set(tokenizeComparableText(names.shortName));
+  const rawTokens = tokenizeComparableText(rawQuery).filter((t) => t.length > 1);
+  const queryTokens = tokenizeComparableText(queryVariant).filter((t) => t.length > 1);
+
+  let score = 0;
+
+  if (titleNorm === rawNorm) score += 140;
+  if (titleNorm === queryNorm) score += 90;
+  if (titleNorm.includes(rawNorm) && rawNorm) score += 50;
+  if (titleNorm.includes(queryNorm) && queryNorm) score += 35;
+
+  for (const token of rawTokens) {
+    if (titleTokens.has(token)) score += 16;
+  }
+  for (const token of queryTokens) {
+    if (titleTokens.has(token)) score += 8;
+  }
+
+  if (anchor) {
+    if (anchor.countryCode) {
+      if (normalizeComparableText(bits.countryCode) === normalizeComparableText(anchor.countryCode)) score += 120;
+      else score -= 260;
+    }
+
+    const stateMatch =
+      (anchor.stateCode && bits.stateCode && normalizeComparableText(bits.stateCode) === normalizeComparableText(anchor.stateCode)) ||
+      (anchor.state && bits.state && normalizeComparableText(bits.state) === normalizeComparableText(anchor.state));
+
+    if (stateMatch) score += 80;
+
+    if (anchor.city) {
+      const cityMatch = bits.city && normalizeComparableText(bits.city) === normalizeComparableText(anchor.city);
+      if (cityMatch) score += 170;
+      else score -= 25;
+    }
+
+    const distanceMi = haversineMiles(anchor.lat, anchor.lng, item?.position?.lat, item?.position?.lng);
+    if (typeof distanceMi === "number") {
+      if (distanceMi <= 2) score += 120;
+      else if (distanceMi <= 5) score += 100;
+      else if (distanceMi <= 15) score += 70;
+      else if (distanceMi <= 30) score += 40;
+      else if (distanceMi <= 100) score += 10;
+      else if (distanceMi > 250) score -= 80;
+      else if (distanceMi > 1000) score -= 200;
+      else if (distanceMi > 3000) score -= 300;
+    }
+  }
+
+  return score;
+}
+
+async function geocodeSingleWithHere(rawQuery, options = {}) {
   const query = normalizePlaceQuery(rawQuery);
+  const anchor = options?.anchor || null;
   if (!query) {
     return {
       query: safeString(rawQuery),
@@ -87,42 +307,103 @@ async function geocodeSingleWithHere(rawQuery) {
       displayName: safeString(rawQuery),
       lat: null,
       lng: null,
+      city: "",
+      stateCode: "",
+      state: "",
+      countryCode: "",
+      countryName: "",
       resolved: false
     };
   }
-  const cacheKey = query.toLowerCase();
+
+  const cacheKey = JSON.stringify({
+    q: query.toLowerCase(),
+    city: normalizeComparableText(anchor?.city || ""),
+    state: normalizeComparableText(anchor?.stateCode || anchor?.state || ""),
+    country: normalizeComparableText(anchor?.countryCode || "")
+  });
   if (routeGeocodeCache.has(cacheKey)) return routeGeocodeCache.get(cacheKey);
-  if (!HERE_API_KEY) {
-    throw new Error("Missing HERE_API_KEY in environment.");
+
+  const variants = buildQueryVariants(query, anchor);
+  let bestItem = null;
+  let bestScore = -Infinity;
+
+  for (const variant of variants) {
+    const items = await fetchHereGeocodeCandidates(variant, anchor ? 5 : 3);
+    for (const item of items) {
+      if (typeof item?.position?.lat !== "number" || typeof item?.position?.lng !== "number") continue;
+      const score = scoreHereCandidate(item, query, variant, anchor);
+      if (score > bestScore) {
+        bestScore = score;
+        bestItem = item;
+      }
+    }
   }
 
-  const url = `https://geocode.search.hereapi.com/v1/geocode?q=${encodeURIComponent(query)}&limit=1&apiKey=${encodeURIComponent(HERE_API_KEY)}`;
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`HERE geocode failed with status ${response.status}`);
-  }
-  const data = await response.json();
-  const item = Array.isArray(data.items) ? data.items[0] : null;
-  if (!item || typeof item?.position?.lat !== "number" || typeof item?.position?.lng !== "number") {
+  if (!bestItem) {
     const unresolved = {
       query,
       shortName: query,
       displayName: query,
       lat: null,
       lng: null,
+      city: "",
+      stateCode: "",
+      state: "",
+      countryCode: "",
+      countryName: "",
       resolved: false
     };
     routeGeocodeCache.set(cacheKey, unresolved);
     return unresolved;
   }
 
-  const names = buildHereDisplayNames(item);
+  const names = buildHereDisplayNames(bestItem);
+  const bits = getHereAddressBits(bestItem);
+  const distanceFromAnchorMi = anchor
+    ? haversineMiles(anchor.lat, anchor.lng, bestItem.position.lat, bestItem.position.lng)
+    : null;
+
+  const mismatchedCountry =
+    anchor?.countryCode &&
+    bits.countryCode &&
+    normalizeComparableText(anchor.countryCode) !== normalizeComparableText(bits.countryCode);
+
+  const obviouslyFar =
+    anchor &&
+    typeof distanceFromAnchorMi === "number" &&
+    distanceFromAnchorMi > 500 &&
+    !(bits.city && anchor.city && normalizeComparableText(bits.city) === normalizeComparableText(anchor.city));
+
+  if ((mismatchedCountry && obviouslyFar) || bestScore < 25) {
+    const unresolved = {
+      query,
+      shortName: query,
+      displayName: query,
+      lat: null,
+      lng: null,
+      city: "",
+      stateCode: "",
+      state: "",
+      countryCode: "",
+      countryName: "",
+      resolved: false
+    };
+    routeGeocodeCache.set(cacheKey, unresolved);
+    return unresolved;
+  }
+
   const resolved = {
     query,
     shortName: names.shortName,
     displayName: names.displayName,
-    lat: item.position.lat,
-    lng: item.position.lng,
+    lat: bestItem.position.lat,
+    lng: bestItem.position.lng,
+    city: bits.city,
+    stateCode: bits.stateCode,
+    state: bits.state,
+    countryCode: bits.countryCode,
+    countryName: bits.countryName,
     resolved: true
   };
   routeGeocodeCache.set(cacheKey, resolved);
@@ -199,14 +480,28 @@ app.post("/geocode_batch", async (req, res) => {
       return res.status(400).json({ error: "startText, endText, and stopTexts[] are required." });
     }
 
-    const [start, end, ...resolvedStops] = await Promise.all([
+    const [start, end] = await Promise.all([
       geocodeSingleWithHere(startText),
-      geocodeSingleWithHere(endText),
-      ...stops.map((stop) => geocodeSingleWithHere(stop))
+      geocodeSingleWithHere(endText)
     ]);
+
+    const anchor = inferAnchorContext(start, end);
+    const resolvedStops = [];
+    for (const stop of stops) {
+      resolvedStops.push(await geocodeSingleWithHere(stop, { anchor }));
+    }
 
     return res.json({
       provider: "here",
+      routeContext: anchor
+        ? {
+            city: anchor.city || "",
+            stateCode: anchor.stateCode || "",
+            state: anchor.state || "",
+            countryCode: anchor.countryCode || "",
+            countryName: anchor.countryName || ""
+          }
+        : null,
       start,
       end,
       stops: resolvedStops
