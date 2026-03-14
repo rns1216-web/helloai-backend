@@ -94,6 +94,38 @@ function buildHereDisplayNames(item) {
   };
 }
 
+function canonicalRouteDisplayName(rawQuery, anchor) {
+  const q = normalizeComparableText(rawQuery);
+  const anchorCity = normalizeComparableText(anchor?.city || "");
+  const isChicago = anchorCity === "chicago";
+
+  if (isChicago) {
+    const canon = {
+      "millennium park": "Millennium Park",
+      "park millennium": "Millennium Park",
+      "art institute": "Art Institute of Chicago",
+      "art institute of chicago": "Art Institute of Chicago",
+      "the bean": "Cloud Gate (The Bean)",
+      "cloud gate": "Cloud Gate (The Bean)",
+      "shedd aquarium": "Shedd Aquarium",
+      "aquarium": "Shedd Aquarium",
+      "john g shedd aquarium": "Shedd Aquarium",
+      "lincoln park zoo": "Lincoln Park Zoo",
+      "lincoln park": "Lincoln Park Zoo",
+      "chicago riverwalk": "Chicago Riverwalk",
+      "riverwalk": "Chicago Riverwalk",
+      "wicker park": "Wicker Park",
+      "portillos": "Portillo's",
+      "portillos chicago": "Portillo's",
+      "portillo s": "Portillo's",
+      "portillo's": "Portillo's"
+    };
+    if (canon[q]) return canon[q];
+  }
+
+  return "";
+}
+
 function getHereAddressBits(item) {
   const address = item?.address || {};
   return {
@@ -393,10 +425,18 @@ async function geocodeSingleWithHere(rawQuery, options = {}) {
     return unresolved;
   }
 
+  const canonicalName = canonicalRouteDisplayName(rawQuery, anchor);
+  const finalShortName = canonicalName || names.shortName;
+  const finalDisplayName = canonicalName
+    ? ((bits.city || bits.stateCode || bits.countryCode)
+        ? `${finalShortName} — ${[bits.city, bits.stateCode || bits.countryCode].filter(Boolean).join(", ")}`
+        : finalShortName)
+    : names.displayName;
+
   const resolved = {
     query,
-    shortName: names.shortName,
-    displayName: names.displayName,
+    shortName: finalShortName,
+    displayName: finalDisplayName,
     lat: bestItem.position.lat,
     lng: bestItem.position.lng,
     city: bits.city,
