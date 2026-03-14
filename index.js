@@ -16,6 +16,8 @@ if (!process.env.OPENAI_API_KEY) {
 
 // SerpApi (DuckDuckGo) key for Evidence Search
 const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY;
+const HERE_API_KEY = process.env.HERE_API_KEY || "";
+const routeGeocodeCache = new Map();
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
@@ -57,6 +59,74 @@ function decodeHtmlEntities(str) {
 
 function stripTags(str) {
   return safeString(str).replace(/<[^>]*>/g, "").trim();
+}
+
+function normalizePlaceQuery(text) {
+  return safeString(text).replace(/\s+/g, " ").trim();
+}
+
+function buildHereDisplayNames(item) {
+  const title = safeString(item?.title).trim() || safeString(item?.address?.label).trim() || "Unknown place";
+  const address = item?.address || {};
+  const city = safeString(address.city || address.county || address.district).trim();
+  const state = safeString(address.stateCode || address.state).trim();
+  const country = safeString(address.countryCode || address.countryName).trim();
+  const suffix = [city, state || country].filter(Boolean).join(", ");
+  return {
+    shortName: title,
+    displayName: suffix ? `${title} — ${suffix}` : title
+  };
+}
+
+async function geocodeSingleWithHere(rawQuery) {
+  const query = normalizePlaceQuery(rawQuery);
+  if (!query) {
+    return {
+      query: safeString(rawQuery),
+      shortName: safeString(rawQuery),
+      displayName: safeString(rawQuery),
+      lat: null,
+      lng: null,
+      resolved: false
+    };
+  }
+  const cacheKey = query.toLowerCase();
+  if (routeGeocodeCache.has(cacheKey)) return routeGeocodeCache.get(cacheKey);
+  if (!HERE_API_KEY) {
+    throw new Error("Missing HERE_API_KEY in environment.");
+  }
+
+  const url = `https://geocode.search.hereapi.com/v1/geocode?q=${encodeURIComponent(query)}&limit=1&apiKey=${encodeURIComponent(HERE_API_KEY)}`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`HERE geocode failed with status ${response.status}`);
+  }
+  const data = await response.json();
+  const item = Array.isArray(data.items) ? data.items[0] : null;
+  if (!item || typeof item?.position?.lat !== "number" || typeof item?.position?.lng !== "number") {
+    const unresolved = {
+      query,
+      shortName: query,
+      displayName: query,
+      lat: null,
+      lng: null,
+      resolved: false
+    };
+    routeGeocodeCache.set(cacheKey, unresolved);
+    return unresolved;
+  }
+
+  const names = buildHereDisplayNames(item);
+  const resolved = {
+    query,
+    shortName: names.shortName,
+    displayName: names.displayName,
+    lat: item.position.lat,
+    lng: item.position.lng,
+    resolved: true
+  };
+  routeGeocodeCache.set(cacheKey, resolved);
+  return resolved;
 }
 
 // Very simple credibility heuristic (Phase 3b-ready; replace later)
@@ -107,6 +177,44 @@ function credibilityScoreFor(url, source) {
 // --------------------------------------------------
 app.get("/", (req, res) => {
   res.json({ status: "ok", message: "HelloAI backend is running 🚀" });
+});
+
+// --------------------------------------------------
+// HERE GEOCODE BATCH ENDPOINT (DISTANCE ROUTE PLANNER)
+// Expects: { startText: string, endText: string, stopTexts: string[] }
+// Returns: resolved names + lat/lng for Haversine distance math on the client
+// --------------------------------------------------
+app.post("/geocode_batch", async (req, res) => {
+  try {
+    const { startText, endText, stopTexts } = req.body || {};
+    if (!HERE_API_KEY) {
+      return res.status(500).json({ error: "Missing HERE_API_KEY in environment." });
+    }
+
+    const stops = Array.isArray(stopTexts)
+      ? stopTexts.map((x) => normalizePlaceQuery(x)).filter(Boolean)
+      : [];
+
+    if (!safeString(startText).trim() || !safeString(endText).trim() || !stops.length) {
+      return res.status(400).json({ error: "startText, endText, and stopTexts[] are required." });
+    }
+
+    const [start, end, ...resolvedStops] = await Promise.all([
+      geocodeSingleWithHere(startText),
+      geocodeSingleWithHere(endText),
+      ...stops.map((stop) => geocodeSingleWithHere(stop))
+    ]);
+
+    return res.json({
+      provider: "here",
+      start,
+      end,
+      stops: resolvedStops
+    });
+  } catch (err) {
+    console.error("❌ /geocode_batch failed:", err);
+    return res.status(500).json({ error: "Geocode batch failed", details: err.message });
+  }
 });
 
 // --------------------------------------------------
