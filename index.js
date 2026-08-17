@@ -1,3 +1,6 @@
+// LinkLyfe drop-in replacement
+// Route Planner routing repair v3: normal-mode region inference + user-order preservation support.
+// Phase 2 Firebase ID-token authentication remains unchanged.
 // index.js — HelloAI Backend (Full Working Version + Agent Smith + Evidence Search via SerpApi DuckDuckGo)
 
 const express = require("express");
@@ -394,9 +397,9 @@ function scoreHereCandidate(item, rawQuery, queryVariant, anchor) {
       else if (distanceMi <= 15) score += 70;
       else if (distanceMi <= 30) score += 40;
       else if (distanceMi <= 100) score += 10;
-      else if (distanceMi > 250) score -= 80;
-      else if (distanceMi > 1000) score -= 200;
       else if (distanceMi > 3000) score -= 300;
+      else if (distanceMi > 1000) score -= 200;
+      else if (distanceMi > 250) score -= 80;
     }
   }
 
@@ -406,6 +409,10 @@ function scoreHereCandidate(item, rawQuery, queryVariant, anchor) {
 async function geocodeSingleWithHere(rawQuery, options = {}) {
   const query = normalizePlaceQuery(rawQuery);
   const anchor = options?.anchor || null;
+  const maxAnchorDistanceMi =
+    typeof options?.maxAnchorDistanceMi === "number" && Number.isFinite(options.maxAnchorDistanceMi)
+      ? Math.max(1, options.maxAnchorDistanceMi)
+      : null;
   if (!query) {
     return {
       query: safeString(rawQuery),
@@ -426,7 +433,8 @@ async function geocodeSingleWithHere(rawQuery, options = {}) {
     q: query.toLowerCase(),
     city: normalizeComparableText(anchor?.city || ""),
     state: normalizeComparableText(anchor?.stateCode || anchor?.state || ""),
-    country: normalizeComparableText(anchor?.countryCode || "")
+    country: normalizeComparableText(anchor?.countryCode || ""),
+    maxAnchorDistanceMi: maxAnchorDistanceMi || 0
   });
   if (routeGeocodeCache.has(cacheKey)) return routeGeocodeCache.get(cacheKey);
 
@@ -481,7 +489,13 @@ async function geocodeSingleWithHere(rawQuery, options = {}) {
     distanceFromAnchorMi > 500 &&
     !(bits.city && anchor.city && normalizeComparableText(bits.city) === normalizeComparableText(anchor.city));
 
-  if ((mismatchedCountry && obviouslyFar) || bestScore < 25) {
+  const outsideProbeRadius =
+    anchor &&
+    maxAnchorDistanceMi !== null &&
+    typeof distanceFromAnchorMi === "number" &&
+    distanceFromAnchorMi > maxAnchorDistanceMi;
+
+  if (outsideProbeRadius || (mismatchedCountry && obviouslyFar) || bestScore < 25) {
     const unresolved = {
       query,
       shortName: query,
@@ -522,6 +536,182 @@ async function geocodeSingleWithHere(rawQuery, options = {}) {
   };
   routeGeocodeCache.set(cacheKey, resolved);
   return resolved;
+}
+
+
+function routeAnchorFromPoint(point) {
+  return point?.resolved ? inferAnchorContext(point, point) : null;
+}
+
+function routeAnchorKey(anchor) {
+  if (!anchor) return "";
+  return [
+    normalizeComparableText(anchor.city || ""),
+    normalizeComparableText(anchor.stateCode || anchor.state || ""),
+    normalizeComparableText(anchor.countryCode || anchor.countryName || ""),
+    typeof anchor.lat === "number" ? anchor.lat.toFixed(2) : "",
+    typeof anchor.lng === "number" ? anchor.lng.toFixed(2) : ""
+  ].join("|");
+}
+
+function routeQueryTokenCount(query) {
+  return tokenizeComparableText(query).filter((token) => token.length >= 3).length;
+}
+
+function routeSeedQueries(startText, endText, stops) {
+  const raw = [
+    safeString(startText).trim(),
+    safeString(endText).trim(),
+    ...stops
+  ].filter(Boolean);
+
+  const distinct = [];
+  for (const query of raw) {
+    const normalized = normalizeComparableText(query);
+    if (!normalized) continue;
+    if (!distinct.some((existing) => normalizeComparableText(existing) === normalized)) {
+      distinct.push(query);
+    }
+  }
+
+  // Long/distinctive place names are usually safer regional seeds than short generic labels.
+  return distinct
+    .map((query, index) => ({ query, index, tokens: routeQueryTokenCount(query) }))
+    .sort((a, b) => (b.tokens - a.tokens) || (a.index - b.index))
+    .slice(0, 6)
+    .map((item) => item.query);
+}
+
+function routeProbeQueries(startText, endText, stops) {
+  const seeds = routeSeedQueries(startText, endText, stops);
+  const endpoints = [safeString(startText).trim(), safeString(endText).trim()].filter(Boolean);
+  const combined = [...endpoints, ...seeds];
+
+  const distinct = [];
+  for (const query of combined) {
+    const normalized = normalizeComparableText(query);
+    if (!normalized) continue;
+    if (!distinct.some((existing) => normalizeComparableText(existing) === normalized)) {
+      distinct.push(query);
+    }
+  }
+  return distinct.slice(0, 5);
+}
+
+function routeAnchorLexicalSupport(anchor, allRouteText) {
+  if (!anchor) return 0;
+  const routeTokens = tokenizeComparableText(allRouteText).filter((token) => token.length >= 4);
+  if (!routeTokens.length) return 0;
+
+  const anchorTokens = new Set(
+    tokenizeComparableText(
+      [
+        anchor.city || "",
+        anchor.stateCode || "",
+        anchor.state || "",
+        anchor.countryCode || "",
+        anchor.countryName || ""
+      ].join(" ")
+    ).filter((token) => token.length >= 3)
+  );
+
+  let support = 0;
+  for (const token of routeTokens) {
+    if (anchorTokens.has(token)) support += 1;
+  }
+  return Math.min(8, support);
+}
+
+async function inferRouteRegionAnchor(startText, endText, stops) {
+  const seedQueries = routeSeedQueries(startText, endText, stops);
+  if (!seedQueries.length) return null;
+
+  const seedResults = [];
+  for (const query of seedQueries) {
+    const point = await geocodeSingleWithHere(query);
+    const anchor = routeAnchorFromPoint(point);
+    if (anchor) seedResults.push({ query, point, anchor });
+  }
+  if (!seedResults.length) return null;
+
+  const dedupedSeeds = [];
+  const seen = new Set();
+  for (const seed of seedResults) {
+    const key = routeAnchorKey(seed.anchor);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    dedupedSeeds.push(seed);
+  }
+
+  const allRouteText = [startText, endText, ...stops].join(" ");
+  const probeQueries = routeProbeQueries(startText, endText, stops);
+  let best = null;
+
+  // Keep this bounded: at most four candidate regions and five probe queries.
+  for (const seed of dedupedSeeds.slice(0, 4)) {
+    let score = routeAnchorLexicalSupport(seed.anchor, allRouteText);
+    let resolvedProbeCount = 0;
+    let nonSelfResolvedCount = 0;
+
+    for (const probeQuery of probeQueries) {
+      const probe = await geocodeSingleWithHere(probeQuery, {
+        anchor: seed.anchor,
+        maxAnchorDistanceMi: 175
+      });
+
+      if (!probe?.resolved) {
+        score -= 1;
+        continue;
+      }
+
+      resolvedProbeCount += 1;
+      const isSelf =
+        normalizeComparableText(probeQuery) === normalizeComparableText(seed.query);
+
+      if (isSelf) {
+        score += 1;
+      } else {
+        nonSelfResolvedCount += 1;
+        score += 4;
+      }
+
+      const distanceMi = haversineMiles(
+        seed.anchor.lat,
+        seed.anchor.lng,
+        probe.lat,
+        probe.lng
+      );
+      if (typeof distanceMi === "number") {
+        if (distanceMi <= 25) score += 2;
+        else if (distanceMi <= 75) score += 1;
+      }
+    }
+
+    const candidate = {
+      anchor: seed.anchor,
+      score,
+      resolvedProbeCount,
+      nonSelfResolvedCount
+    };
+
+    if (
+      !best ||
+      candidate.score > best.score ||
+      (candidate.score === best.score && candidate.nonSelfResolvedCount > best.nonSelfResolvedCount) ||
+      (
+        candidate.score === best.score &&
+        candidate.nonSelfResolvedCount === best.nonSelfResolvedCount &&
+        candidate.resolvedProbeCount > best.resolvedProbeCount
+      )
+    ) {
+      best = candidate;
+    }
+  }
+
+  // Require support from at least one OTHER route input. A seed that only resolves itself
+  // is not enough evidence to force the entire route into that city/state.
+  if (!best || best.nonSelfResolvedCount < 1 || best.score < 4) return null;
+  return best.anchor;
 }
 
 // Very simple credibility heuristic (Phase 3b-ready; replace later)
@@ -594,14 +784,23 @@ app.post("/geocode_batch", requireFirebaseIdToken, async (req, res) => {
       return res.status(400).json({ error: "startText, endText, and stopTexts[] are required." });
     }
 
+    // NORMAL MODE FIRST:
+    // Infer one trustworthy regional anchor from the route inputs themselves.
+    // This prevents generic names such as "Clifton Hill" or "Hornblower" from
+    // silently resolving to unrelated places in other states/countries.
+    const inferredAnchor = await inferRouteRegionAnchor(startText, endText, stops);
+
     const [start, end] = await Promise.all([
-      geocodeSingleWithHere(startText),
-      geocodeSingleWithHere(endText)
+      geocodeSingleWithHere(startText, { anchor: inferredAnchor }),
+      geocodeSingleWithHere(endText, { anchor: inferredAnchor })
     ]);
 
-    const anchor = inferAnchorContext(start, end);
+    const endpointAnchor = inferAnchorContext(start, end);
+    const anchor = inferredAnchor || endpointAnchor;
+
     const resolvedStops = [];
     for (const stop of stops) {
+      // Preserve the user's list order exactly.
       resolvedStops.push(await geocodeSingleWithHere(stop, { anchor }));
     }
 
