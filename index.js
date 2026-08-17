@@ -4,9 +4,50 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const { OpenAI } = require("openai");
+const { initializeApp, applicationDefault, cert, getApps } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
 
 // Load .env variables
 dotenv.config();
+
+// --------------------------------------------------
+// FIREBASE ADMIN AUTHENTICATION (PHASE 2)
+// --------------------------------------------------
+// Preferred on Render: store the service-account JSON only in the protected
+// FIREBASE_SERVICE_ACCOUNT_JSON environment variable. Never commit it to GitHub.
+// GOOGLE_APPLICATION_CREDENTIALS remains supported for deployments that use a
+// protected service-account file / Application Default Credentials instead.
+function initializeLinklyfeFirebaseAdmin() {
+  if (getApps().length > 0) return getApps()[0];
+
+  const serviceAccountJson = (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
+  if (serviceAccountJson) {
+    const serviceAccount = JSON.parse(serviceAccountJson);
+    return initializeApp({
+      credential: cert(serviceAccount),
+      projectId: serviceAccount.project_id
+    });
+  }
+
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    return initializeApp({
+      credential: applicationDefault(),
+      projectId: process.env.FIREBASE_PROJECT_ID || undefined
+    });
+  }
+
+  throw new Error("Firebase Admin credentials are not configured.");
+}
+
+try {
+  initializeLinklyfeFirebaseAdmin();
+} catch (_) {
+  console.error(
+    "❌ Firebase Admin initialization failed. Configure FIREBASE_SERVICE_ACCOUNT_JSON " +
+    "or GOOGLE_APPLICATION_CREDENTIALS before starting the backend."
+  );
+  process.exit(1);
+}
 
 // Ensure OpenAI key exists
 if (!process.env.OPENAI_API_KEY) {
@@ -28,6 +69,39 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
+
+function bearerTokenFromRequest(req) {
+  const authorization = typeof req.headers.authorization === "string"
+    ? req.headers.authorization.trim()
+    : "";
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : "";
+}
+
+async function requireFirebaseIdToken(req, res, next) {
+  const idToken = bearerTokenFromRequest(req);
+  if (!idToken) {
+    return res.status(401).json({
+      error: true,
+      message: "Authentication required."
+    });
+  }
+
+  try {
+    const decodedToken = await getAuth().verifyIdToken(idToken);
+    req.linklyfeAuth = {
+      uid: decodedToken.uid,
+      provider: decodedToken.firebase?.sign_in_provider || "unknown",
+      isAnonymous: decodedToken.firebase?.sign_in_provider === "anonymous"
+    };
+    return next();
+  } catch (_) {
+    return res.status(401).json({
+      error: true,
+      message: "Authentication required."
+    });
+  }
+}
 
 // --------------------------------------------------
 // HELPERS (Evidence Search)
@@ -505,7 +579,7 @@ app.get("/", (req, res) => {
 // Expects: { startText: string, endText: string, stopTexts: string[] }
 // Returns: resolved names + lat/lng for Haversine distance math on the client
 // --------------------------------------------------
-app.post("/geocode_batch", async (req, res) => {
+app.post("/geocode_batch", requireFirebaseIdToken, async (req, res) => {
   try {
     const { startText, endText, stopTexts } = req.body || {};
     if (!HERE_API_KEY) {
@@ -555,7 +629,7 @@ app.post("/geocode_batch", async (req, res) => {
 // --------------------------------------------------
 // MINI-BRAIN GENERATE ENDPOINT (MAIN ENDPOINT)
 // --------------------------------------------------
-app.post("/generate", async (req, res) => {
+app.post("/generate", requireFirebaseIdToken, async (req, res) => {
   try {
     const { prompt } = req.body;
 
@@ -588,7 +662,7 @@ app.post("/generate", async (req, res) => {
 // Expects: { prompt: string }
 // Returns: strict JSON matching AgentSmithScreen parser
 // --------------------------------------------------
-app.post("/agent_smith", async (req, res) => {
+app.post("/agent_smith", requireFirebaseIdToken, async (req, res) => {
   try {
     const { prompt } = req.body;
 
@@ -688,7 +762,7 @@ app.post("/agent_smith", async (req, res) => {
 // Expects: { query: string }
 // Returns: { results: EvidenceItem[] }
 // --------------------------------------------------
-app.post("/evidence_search", async (req, res) => {
+app.post("/evidence_search", requireFirebaseIdToken, async (req, res) => {
   try {
     const { query } = req.body;
 
