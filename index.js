@@ -1,4 +1,7 @@
 // LinkLyfe drop-in replacement
+// Route Planner HERE Autosuggest v4.
+// Preserves Phase 2 Firebase auth and the normal-mode Route Planner regional-routing repair.
+// LinkLyfe drop-in replacement
 // Route Planner routing repair v3: normal-mode region inference + user-order preservation support.
 // Phase 2 Firebase ID-token authentication remains unchanged.
 // index.js — HelloAI Backend (Full Working Version + Agent Smith + Evidence Search via SerpApi DuckDuckGo)
@@ -757,11 +760,151 @@ function credibilityScoreFor(url, source) {
   return 60;
 }
 
+
+function routeSuggestionText(item) {
+  const title = safeString(item?.title).trim();
+  const addressLabel = safeString(item?.address?.label).trim();
+
+  if (!title) return addressLabel;
+  if (!addressLabel) return title;
+
+  const normalizedTitle = normalizeComparableText(title);
+  const normalizedAddress = normalizeComparableText(addressLabel);
+  if (normalizedTitle && normalizedAddress.includes(normalizedTitle)) {
+    return addressLabel;
+  }
+  return `${title}, ${addressLabel}`;
+}
+
+function routeSuggestionSubtitle(item) {
+  const title = safeString(item?.title).trim();
+  const addressLabel = safeString(item?.address?.label).trim();
+
+  if (addressLabel && normalizeComparableText(addressLabel) !== normalizeComparableText(title)) {
+    return addressLabel;
+  }
+
+  const address = item?.address || {};
+  return [
+    safeString(address.city || address.district || address.county).trim(),
+    safeString(address.stateCode || address.state).trim(),
+    safeString(address.countryName || address.countryCode).trim()
+  ].filter(Boolean).join(", ");
+}
+
+async function fetchHereAutosuggest(query, anchor, limit = 5) {
+  if (!HERE_API_KEY) {
+    throw new Error("Missing HERE_API_KEY in environment.");
+  }
+  if (!anchor || typeof anchor.lat !== "number" || typeof anchor.lng !== "number") {
+    return [];
+  }
+
+  const url =
+    `https://autosuggest.search.hereapi.com/v1/autosuggest` +
+    `?at=${encodeURIComponent(`${anchor.lat},${anchor.lng}`)}` +
+    `&limit=${encodeURIComponent(String(Math.max(1, Math.min(limit, 5))))}` +
+    `&q=${encodeURIComponent(query)}` +
+    `&apiKey=${encodeURIComponent(HERE_API_KEY)}`;
+
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`HERE autosuggest failed with status ${response.status}`);
+  }
+
+  const data = await response.json();
+  return Array.isArray(data?.items) ? data.items : [];
+}
+
+async function resolveAutosuggestAnchor(query, contextText) {
+  const context = normalizePlaceQuery(contextText);
+
+  // Once the user has a Start point (or Journey destination), keep suggestions
+  // centered around that trip region instead of around the phone's location.
+  if (context) {
+    const contextPoint = await geocodeSingleWithHere(context);
+    if (contextPoint?.resolved) return routeAnchorFromPoint(contextPoint);
+  }
+
+  // First field has no trip context yet. Use HERE geocode only to establish
+  // an approximate search center; the user still chooses the actual suggestion.
+  const queryPoint = await geocodeSingleWithHere(query);
+  return queryPoint?.resolved ? routeAnchorFromPoint(queryPoint) : null;
+}
+
 // --------------------------------------------------
 // HEALTH CHECK
 // --------------------------------------------------
 app.get("/", (req, res) => {
   res.json({ status: "ok", message: "HelloAI backend is running 🚀" });
+});
+
+// --------------------------------------------------
+// HERE PLACE AUTOSUGGEST (DISTANCE ROUTE PLANNER)
+// Expects: { query: string, contextText?: string }
+// Returns only HERE entity/location items that include coordinates.
+// Free-form typing remains valid if no suggestion is selected.
+// --------------------------------------------------
+app.post("/place_autosuggest", requireFirebaseIdToken, async (req, res) => {
+  try {
+    const query = normalizePlaceQuery(req.body?.query);
+    const contextText = normalizePlaceQuery(req.body?.contextText);
+
+    if (!HERE_API_KEY) {
+      return res.status(500).json({ error: "Missing HERE_API_KEY in environment." });
+    }
+
+    if (query.length < 3 || query.length > 180) {
+      return res.status(400).json({ error: "query must be between 3 and 180 characters." });
+    }
+
+    if (contextText.length > 220) {
+      return res.status(400).json({ error: "contextText is too long." });
+    }
+
+    const anchor = await resolveAutosuggestAnchor(query, contextText);
+    if (!anchor) {
+      return res.json({ provider: "here", items: [] });
+    }
+
+    const rawItems = await fetchHereAutosuggest(query, anchor, 5);
+    const items = [];
+
+    for (const item of rawItems) {
+      if (items.length >= 5) break;
+
+      const lat = item?.position?.lat;
+      const lng = item?.position?.lng;
+      if (typeof lat !== "number" || typeof lng !== "number") continue;
+
+      // Autosuggest may also return categoryQuery/chainQuery/query suggestions.
+      // Route Planner needs an actual selectable geographic entity.
+      const resultType = safeString(item?.resultType).trim();
+      if (["categoryQuery", "chainQuery", "query"].includes(resultType)) continue;
+
+      const title = safeString(item?.title).trim();
+      const selectionText = routeSuggestionText(item).trim();
+      if (!title && !selectionText) continue;
+
+      items.push({
+        id: safeString(item?.id).trim(),
+        title: title || selectionText,
+        subtitle: routeSuggestionSubtitle(item),
+        selectionText: selectionText || title,
+        lat,
+        lng,
+        resultType
+      });
+    }
+
+    return res.json({
+      provider: "here",
+      items
+    });
+  } catch (err) {
+    console.error("❌ /place_autosuggest failed:", err);
+    return res.status(500).json({ error: "Place suggestions are unavailable right now." });
+  }
 });
 
 // --------------------------------------------------
