@@ -1,3 +1,6 @@
+// LinkLyfe Phase 5 App Check / Play Integrity backend v10
+// Verifies X-Firebase-AppCheck on all authenticated production endpoints.
+// Defaults to MONITOR mode so rollout cannot break older installed app versions.
 // LinkLyfe Phase 4 backend hardening v9
 // Removes user-content logging, adds request metadata logging + request IDs,
 // generic public error responses, deliberate CORS, security headers,
@@ -31,6 +34,7 @@ const dotenv = require("dotenv");
 const { OpenAI } = require("openai");
 const { initializeApp, applicationDefault, cert, getApps } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
+const { getAppCheck } = require("firebase-admin/app-check");
 const { randomUUID } = require("crypto");
 
 // Load .env variables
@@ -85,6 +89,17 @@ if (!process.env.OPENAI_API_KEY) {
 const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY;
 // Shared restricted Google Maps Platform key: Places API (New) + Routes API only.
 const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || "";
+
+// Phase 5 App Check rollout:
+// - monitor (default): verify/log tokens but never block an otherwise authenticated request.
+// - enforce: reject missing/invalid App Check tokens.
+// Keep monitor during initial rollout so existing installed versions are not broken.
+const APP_CHECK_ENFORCEMENT_MODE =
+  String(process.env.APP_CHECK_ENFORCEMENT_MODE || "monitor")
+    .trim()
+    .toLowerCase() === "enforce"
+    ? "enforce"
+    : "monitor";
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
@@ -149,7 +164,8 @@ app.use((req, res, next) => {
       method: req.method,
       route: req.path,
       status: res.statusCode,
-      durationMs
+      durationMs,
+      appCheckStatus: req.linklyfeAppCheck?.status || "not_checked"
     }));
   });
 
@@ -163,7 +179,7 @@ app.use(cors({
     return callback(null, allowedCorsOrigins.has(origin));
   },
   methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Firebase-AppCheck"],
   exposedHeaders: ["X-Request-Id"],
   credentials: false,
   maxAge: 600
@@ -266,6 +282,54 @@ async function requireFirebaseIdToken(req, res, next) {
       error: true,
       message: "Authentication required."
     });
+  }
+}
+
+
+function firebaseAppCheckTokenFromRequest(req) {
+  const value = req.headers["x-firebase-appcheck"];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+async function verifyLinklyfeAppCheck(req, res, next) {
+  const appCheckToken = firebaseAppCheckTokenFromRequest(req);
+
+  if (!appCheckToken) {
+    req.linklyfeAppCheck = { status: "missing" };
+
+    if (APP_CHECK_ENFORCEMENT_MODE === "enforce") {
+      return res.status(401).json({
+        error: true,
+        message: "App verification required."
+      });
+    }
+
+    return next();
+  }
+
+  try {
+    const decodedAppCheck = await getAppCheck().verifyToken(appCheckToken);
+
+    req.linklyfeAppCheck = {
+      status: "verified",
+      appId:
+        typeof decodedAppCheck?.app_id === "string"
+          ? decodedAppCheck.app_id
+          : ""
+    };
+
+    return next();
+  } catch (_) {
+    req.linklyfeAppCheck = { status: "invalid" };
+
+    if (APP_CHECK_ENFORCEMENT_MODE === "enforce") {
+      return res.status(401).json({
+        error: true,
+        message: "App verification required."
+      });
+    }
+
+    return next();
   }
 }
 
@@ -875,6 +939,7 @@ app.post(
   "/place_autosuggest",
   phase3NetworkGate,
   requireFirebaseIdToken,
+  verifyLinklyfeAppCheck,
   phase3UserGate,
   ...phase3PlaceAutosuggestLimits,
   async (req, res) => {
@@ -942,6 +1007,7 @@ app.post(
   "/route_compute",
   phase3NetworkGate,
   requireFirebaseIdToken,
+  verifyLinklyfeAppCheck,
   phase3UserGate,
   ...phase3RouteComputeLimits,
   async (req, res) => {
@@ -1055,6 +1121,7 @@ app.post(
   "/generate",
   phase3NetworkGate,
   requireFirebaseIdToken,
+  verifyLinklyfeAppCheck,
   phase3UserGate,
   ...phase3GenerateLimits,
   async (req, res) => {
@@ -1094,6 +1161,7 @@ app.post(
   "/agent_smith",
   phase3NetworkGate,
   requireFirebaseIdToken,
+  verifyLinklyfeAppCheck,
   phase3UserGate,
   ...phase3AgentSmithLimits,
   async (req, res) => {
@@ -1196,6 +1264,7 @@ app.post(
   "/evidence_search",
   phase3NetworkGate,
   requireFirebaseIdToken,
+  verifyLinklyfeAppCheck,
   phase3UserGate,
   ...phase3EvidenceSearchLimits,
   async (req, res) => {
