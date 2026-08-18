@@ -1,3 +1,7 @@
+// LinkLyfe Phase 6 monitoring + alert-signal backend v11
+// Adds safe structured monitoring events for security rejections, rate limits,
+// validation failures, slow requests, and server errors without logging user content.
+// Phase 5 App Check / Play Integrity enforcement behavior remains unchanged.
 // LinkLyfe Phase 5 App Check / Play Integrity backend v10
 // Verifies X-Firebase-AppCheck on all authenticated production endpoints.
 // Defaults to MONITOR mode so rollout cannot break older installed app versions.
@@ -157,6 +161,7 @@ app.use((req, res, next) => {
   res.on("finish", () => {
     const elapsedNs = process.hrtime.bigint() - startedAt;
     const durationMs = Number(elapsedNs / 1000000n);
+    const appCheckStatus = req.linklyfeAppCheck?.status || "not_checked";
 
     console.log(JSON.stringify({
       event: "request_complete",
@@ -165,8 +170,28 @@ app.use((req, res, next) => {
       route: req.path,
       status: res.statusCode,
       durationMs,
-      appCheckStatus: req.linklyfeAppCheck?.status || "not_checked"
+      appCheckStatus
     }));
+
+    if (res.statusCode >= 500) {
+      console.error(JSON.stringify({
+        event: "request_server_error",
+        requestId,
+        route: req.path,
+        status: res.statusCode,
+        durationMs,
+        appCheckStatus
+      }));
+    } else if (durationMs >= 15000) {
+      console.warn(JSON.stringify({
+        event: "request_slow",
+        requestId,
+        route: req.path,
+        status: res.statusCode,
+        durationMs,
+        appCheckStatus
+      }));
+    }
   });
 
   next();
@@ -226,6 +251,15 @@ function logBackendError(req, event, err, extra = {}) {
   }));
 }
 
+function logMonitoringEvent(req, event, extra = {}) {
+  console.warn(JSON.stringify({
+    event,
+    requestId: req?.linklyfeRequestId || "startup",
+    route: req?.path || "",
+    ...extra
+  }));
+}
+
 // Phase 3: bound request bodies before any expensive work.
 // 96 KB comfortably covers current LinkLyfe prompts/forms while preventing
 // unbounded JSON payloads from reaching Firebase/OpenAI/Google/SerpApi paths.
@@ -236,6 +270,7 @@ app.use(express.json({
 
 app.use((err, req, res, next) => {
   if (err?.type === "entity.too.large") {
+    logMonitoringEvent(req, "request_body_rejected", { reason: "too_large" });
     return res.status(413).json({
       error: true,
       message: "Request body is too large."
@@ -243,6 +278,7 @@ app.use((err, req, res, next) => {
   }
 
   if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
+    logMonitoringEvent(req, "request_body_rejected", { reason: "invalid_json" });
     return res.status(400).json({
       error: true,
       message: "Invalid JSON request body."
@@ -263,6 +299,7 @@ function bearerTokenFromRequest(req) {
 async function requireFirebaseIdToken(req, res, next) {
   const idToken = bearerTokenFromRequest(req);
   if (!idToken) {
+    logMonitoringEvent(req, "auth_rejected", { reason: "missing_token" });
     return res.status(401).json({
       error: true,
       message: "Authentication required."
@@ -278,6 +315,7 @@ async function requireFirebaseIdToken(req, res, next) {
     };
     return next();
   } catch (_) {
+    logMonitoringEvent(req, "auth_rejected", { reason: "invalid_token" });
     return res.status(401).json({
       error: true,
       message: "Authentication required."
@@ -296,6 +334,10 @@ async function verifyLinklyfeAppCheck(req, res, next) {
 
   if (!appCheckToken) {
     req.linklyfeAppCheck = { status: "missing" };
+    logMonitoringEvent(req, "app_check_rejected", {
+      reason: "missing_token",
+      enforcementMode: APP_CHECK_ENFORCEMENT_MODE
+    });
 
     if (APP_CHECK_ENFORCEMENT_MODE === "enforce") {
       return res.status(401).json({
@@ -321,6 +363,10 @@ async function verifyLinklyfeAppCheck(req, res, next) {
     return next();
   } catch (_) {
     req.linklyfeAppCheck = { status: "invalid" };
+    logMonitoringEvent(req, "app_check_rejected", {
+      reason: "invalid_token",
+      enforcementMode: APP_CHECK_ENFORCEMENT_MODE
+    });
 
     if (APP_CHECK_ENFORCEMENT_MODE === "enforce") {
       return res.status(401).json({
@@ -427,6 +473,7 @@ function phase3RateLimitMiddleware({
   return (req, res, next) => {
     const identityValue = String(identity(req) || "").trim();
     if (!identityValue) {
+      logMonitoringEvent(req, "rate_limit_identity_missing", { scope });
       return res.status(429).json({
         error: true,
         message: "Too many requests. Please try again shortly."
@@ -441,6 +488,10 @@ function phase3RateLimitMiddleware({
     );
 
     if (result.blocked) {
+      logMonitoringEvent(req, "rate_limit_blocked", {
+        scope,
+        retryAfterSeconds: result.retryAfterSeconds
+      });
       res.set("Retry-After", String(result.retryAfterSeconds));
       return res.status(429).json({
         error: true,
@@ -592,6 +643,10 @@ function validateRouteLocationObject(value, fieldName) {
 }
 
 function respondPhase3ValidationError(res, message) {
+  const safeReason = typeof message === "string"
+    ? message.slice(0, 160)
+    : "invalid_request";
+  logMonitoringEvent(res?.req, "validation_rejected", { reason: safeReason });
   return res.status(400).json({
     error: true,
     message
@@ -975,6 +1030,7 @@ app.post(
     const contextText = normalizePlaceQuery(req.body.contextText);
 
     if (!GOOGLE_PLACES_API_KEY) {
+      logMonitoringEvent(req, "provider_config_missing", { provider: "google_places" });
       return res.status(503).json({ error: "Place suggestions are temporarily unavailable." });
     }
 
@@ -1075,6 +1131,7 @@ app.post(
     const contextText = normalizePlaceQuery(req.body.contextText);
 
     if (!GOOGLE_PLACES_API_KEY) {
+      logMonitoringEvent(req, "provider_config_missing", { provider: "google_routes" });
       return res.status(503).json({ error: "Route calculation is temporarily unavailable." });
     }
 
@@ -1401,4 +1458,9 @@ app.use((err, req, res, next) => {
 // --------------------------------------------------
 app.listen(PORT, () => {
   console.log(`✅ HelloAI server listening on port ${PORT}`);
+  console.log(JSON.stringify({
+    event: "server_start",
+    monitoringPhase: "phase6",
+    appCheckEnforcementMode: APP_CHECK_ENFORCEMENT_MODE
+  }));
 });
