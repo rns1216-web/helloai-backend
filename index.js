@@ -1,3 +1,7 @@
+// LinkLyfe Phase 3 security hardening v8
+// Adds bounded JSON parsing, authenticated UID + network rate limits,
+// expensive-endpoint burst/sustained limits, and strict request validation.
+// No Android contract changes; Phase 2 Firebase authentication is preserved.
 // LinkLyfe narrow hotfix v7
 // Fixes GOOGLE_PLACES_API_KEY declaration accidentally commented out in v6.
 // No route behavior, Firebase auth, Places logic, or Routes logic changed.
@@ -14,7 +18,7 @@
 // LinkLyfe drop-in replacement
 // Route Planner routing repair v3: normal-mode region inference + user-order preservation support.
 // Phase 2 Firebase ID-token authentication remains unchanged.
-// index.js â€” HelloAI Backend (Full Working Version + Agent Smith + Evidence Search via SerpApi DuckDuckGo)
+// index.js — HelloAI Backend (Full Working Version + Agent Smith + Evidence Search via SerpApi DuckDuckGo)
 
 const express = require("express");
 const cors = require("cors");
@@ -59,7 +63,7 @@ try {
   initializeLinklyfeFirebaseAdmin();
 } catch (_) {
   console.error(
-    "âŒ Firebase Admin initialization failed. Configure FIREBASE_SERVICE_ACCOUNT_JSON " +
+    "❌ Firebase Admin initialization failed. Configure FIREBASE_SERVICE_ACCOUNT_JSON " +
     "or GOOGLE_APPLICATION_CREDENTIALS before starting the backend."
   );
   process.exit(1);
@@ -67,7 +71,7 @@ try {
 
 // Ensure OpenAI key exists
 if (!process.env.OPENAI_API_KEY) {
-  console.error("âŒ Missing OPENAI_API_KEY in .env");
+  console.error("❌ Missing OPENAI_API_KEY in .env");
   process.exit(1);
 }
 
@@ -86,7 +90,32 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
+
+// Phase 3: bound request bodies before any expensive work.
+// 96 KB comfortably covers current LinkLyfe prompts/forms while preventing
+// unbounded JSON payloads from reaching Firebase/OpenAI/Google/SerpApi paths.
+app.use(express.json({
+  limit: "96kb",
+  strict: true
+}));
+
+app.use((err, req, res, next) => {
+  if (err?.type === "entity.too.large") {
+    return res.status(413).json({
+      error: true,
+      message: "Request body is too large."
+    });
+  }
+
+  if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
+    return res.status(400).json({
+      error: true,
+      message: "Invalid JSON request body."
+    });
+  }
+
+  return next(err);
+});
 
 function bearerTokenFromRequest(req) {
   const authorization = typeof req.headers.authorization === "string"
@@ -119,6 +148,271 @@ async function requireFirebaseIdToken(req, res, next) {
       message: "Authentication required."
     });
   }
+}
+
+
+// --------------------------------------------------
+// PHASE 3 — RATE LIMITING + REQUEST VALIDATION
+// --------------------------------------------------
+// This limiter is intentionally dependency-free so the patch does not change
+// package.json/package-lock.json. It protects both authenticated UID and a
+// best-effort network key. If the service is horizontally scaled later, move
+// the limiter state to a shared store such as Redis.
+
+const phase3RateBuckets = new Map();
+const PHASE3_RATE_BUCKET_TTL_MS = 30 * 60 * 1000;
+
+function normalizedNetworkPart(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^::ffff:/i, "")
+    .slice(0, 120);
+}
+
+function requestNetworkKey(req) {
+  // Managed proxies normally append to X-Forwarded-For. Taking the right-most
+  // entry avoids trusting a client-supplied left-most value when one exists.
+  const forwarded = typeof req.headers["x-forwarded-for"] === "string"
+    ? req.headers["x-forwarded-for"]
+        .split(",")
+        .map((part) => normalizedNetworkPart(part))
+        .filter(Boolean)
+    : [];
+
+  const forwardedCandidate = forwarded.length
+    ? forwarded[forwarded.length - 1]
+    : "";
+
+  return forwardedCandidate ||
+    normalizedNetworkPart(req.socket?.remoteAddress) ||
+    "unknown-network";
+}
+
+function prunePhase3RateBuckets(now = Date.now()) {
+  for (const [key, bucket] of phase3RateBuckets.entries()) {
+    if (!bucket || now - bucket.lastSeenAt > PHASE3_RATE_BUCKET_TTL_MS) {
+      phase3RateBuckets.delete(key);
+    }
+  }
+}
+
+const phase3RatePruneTimer = setInterval(
+  () => prunePhase3RateBuckets(),
+  5 * 60 * 1000
+);
+phase3RatePruneTimer.unref?.();
+
+function consumePhase3RateLimit(scope, identity, limit, windowMs) {
+  const now = Date.now();
+  const key = `${scope}:${identity}`;
+  let bucket = phase3RateBuckets.get(key);
+
+  if (!bucket || now >= bucket.resetAt) {
+    bucket = {
+      count: 0,
+      resetAt: now + windowMs,
+      lastSeenAt: now
+    };
+  }
+
+  bucket.count += 1;
+  bucket.lastSeenAt = now;
+  phase3RateBuckets.set(key, bucket);
+
+  if (bucket.count > limit) {
+    return {
+      blocked: true,
+      retryAfterSeconds: Math.max(
+        1,
+        Math.ceil((bucket.resetAt - now) / 1000)
+      )
+    };
+  }
+
+  return {
+    blocked: false,
+    retryAfterSeconds: 0
+  };
+}
+
+function phase3RateLimitMiddleware({
+  scope,
+  limit,
+  windowMs,
+  identity
+}) {
+  return (req, res, next) => {
+    const identityValue = String(identity(req) || "").trim();
+    if (!identityValue) {
+      return res.status(429).json({
+        error: true,
+        message: "Too many requests. Please try again shortly."
+      });
+    }
+
+    const result = consumePhase3RateLimit(
+      scope,
+      identityValue,
+      limit,
+      windowMs
+    );
+
+    if (result.blocked) {
+      res.set("Retry-After", String(result.retryAfterSeconds));
+      return res.status(429).json({
+        error: true,
+        message: "Too many requests. Please try again shortly."
+      });
+    }
+
+    return next();
+  };
+}
+
+const phase3NetworkGate = phase3RateLimitMiddleware({
+  scope: "network-global",
+  limit: 180,
+  windowMs: 60 * 1000,
+  identity: requestNetworkKey
+});
+
+const phase3UserGate = phase3RateLimitMiddleware({
+  scope: "uid-global",
+  limit: 90,
+  windowMs: 60 * 1000,
+  identity: (req) => req.linklyfeAuth?.uid
+});
+
+function phase3UserEndpointLimits(name, burstLimit, sustainedLimit) {
+  return [
+    phase3RateLimitMiddleware({
+      scope: `${name}-burst`,
+      limit: burstLimit,
+      windowMs: 60 * 1000,
+      identity: (req) => req.linklyfeAuth?.uid
+    }),
+    phase3RateLimitMiddleware({
+      scope: `${name}-sustained`,
+      limit: sustainedLimit,
+      windowMs: 10 * 60 * 1000,
+      identity: (req) => req.linklyfeAuth?.uid
+    })
+  ];
+}
+
+const phase3GenerateLimits = phase3UserEndpointLimits(
+  "generate",
+  6,
+  24
+);
+const phase3AgentSmithLimits = phase3UserEndpointLimits(
+  "agent-smith",
+  4,
+  12
+);
+const phase3EvidenceSearchLimits = phase3UserEndpointLimits(
+  "evidence-search",
+  8,
+  30
+);
+const phase3PlaceAutosuggestLimits = phase3UserEndpointLimits(
+  "place-autosuggest",
+  45,
+  150
+);
+const phase3RouteComputeLimits = phase3UserEndpointLimits(
+  "route-compute",
+  8,
+  20
+);
+
+function isJsonObject(value) {
+  return value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value);
+}
+
+function validateAllowedKeys(value, allowedKeys) {
+  if (!isJsonObject(value)) {
+    return "Request body must be a JSON object.";
+  }
+
+  const allowed = new Set(allowedKeys);
+  const hasUnknownKey = Object.keys(value).some((key) => !allowed.has(key));
+  return hasUnknownKey
+    ? "Request contains unsupported fields."
+    : "";
+}
+
+function validateStringValue(
+  value,
+  {
+    fieldName,
+    required = false,
+    minLength = 0,
+    maxLength
+  }
+) {
+  if (value === undefined || value === null) {
+    return required ? `${fieldName} is required.` : "";
+  }
+
+  if (typeof value !== "string") {
+    return `${fieldName} must be a string.`;
+  }
+
+  const trimmedLength = value.trim().length;
+  if (required && trimmedLength === 0) {
+    return `${fieldName} is required.`;
+  }
+
+  if (trimmedLength < minLength) {
+    return `${fieldName} is too short.`;
+  }
+
+  if (typeof maxLength === "number" && value.length > maxLength) {
+    return `${fieldName} is too long.`;
+  }
+
+  return "";
+}
+
+function validateSimplePromptBody(body, maxLength) {
+  const shapeError = validateAllowedKeys(body, ["prompt"]);
+  if (shapeError) return shapeError;
+
+  return validateStringValue(body.prompt, {
+    fieldName: "prompt",
+    required: true,
+    minLength: 1,
+    maxLength
+  });
+}
+
+function validateRouteLocationObject(value, fieldName) {
+  const shapeError = validateAllowedKeys(value, ["text", "placeId"]);
+  if (shapeError) return `${fieldName} is invalid.`;
+
+  const textError = validateStringValue(value.text, {
+    fieldName: `${fieldName}.text`,
+    required: true,
+    minLength: 1,
+    maxLength: 240
+  });
+  if (textError) return textError;
+
+  return validateStringValue(value.placeId, {
+    fieldName: `${fieldName}.placeId`,
+    required: false,
+    maxLength: 180
+  });
+}
+
+function respondPhase3ValidationError(res, message) {
+  return res.status(400).json({
+    error: true,
+    message
+  });
 }
 
 // --------------------------------------------------
@@ -160,7 +454,7 @@ function normalizePlaceQuery(text) {
 function normalizeComparableText(text) {
   return normalizePlaceQuery(text)
     .toLowerCase()
-    .replace(/[â€™']/g, "")
+    .replace(/[’']/g, "")
     .replace(/[^a-z0-9\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -182,7 +476,7 @@ function buildHereDisplayNames(item) {
   const suffix = [city, state || country].filter(Boolean).join(", ");
   return {
     shortName: title,
-    displayName: suffix ? `${title} â€” ${suffix}` : title
+    displayName: suffix ? `${title} — ${suffix}` : title
   };
 }
 
@@ -532,7 +826,7 @@ async function geocodeSingleWithHere(rawQuery, options = {}) {
   const finalShortName = canonicalName || names.shortName;
   const finalDisplayName = canonicalName
     ? ((bits.city || bits.stateCode || bits.countryCode)
-        ? `${finalShortName} â€” ${[bits.city, bits.stateCode || bits.countryCode].filter(Boolean).join(", ")}`
+        ? `${finalShortName} — ${[bits.city, bits.stateCode || bits.countryCode].filter(Boolean).join(", ")}`
         : finalShortName)
     : names.displayName;
 
@@ -1020,7 +1314,7 @@ async function computeGoogleOrderedRoute(allPoints, contextText = "") {
 // HEALTH CHECK
 // --------------------------------------------------
 app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "HelloAI backend is running ðŸš€" });
+  res.json({ status: "ok", message: "HelloAI backend is running 🚀" });
 });
 
 // --------------------------------------------------
@@ -1029,21 +1323,46 @@ app.get("/", (req, res) => {
 // Returns Google place predictions only; no Place Details request is made.
 // Free-form typing remains valid if no suggestion is selected.
 // --------------------------------------------------
-app.post("/place_autosuggest", requireFirebaseIdToken, async (req, res) => {
+app.post(
+  "/place_autosuggest",
+  phase3NetworkGate,
+  requireFirebaseIdToken,
+  phase3UserGate,
+  ...phase3PlaceAutosuggestLimits,
+  async (req, res) => {
   try {
-    const query = normalizePlaceQuery(req.body?.query);
-    const contextText = normalizePlaceQuery(req.body?.contextText);
+    const bodyShapeError = validateAllowedKeys(
+      req.body,
+      ["query", "contextText"]
+    );
+    if (bodyShapeError) {
+      return respondPhase3ValidationError(res, bodyShapeError);
+    }
+
+    const queryTypeError = validateStringValue(req.body.query, {
+      fieldName: "query",
+      required: true,
+      minLength: 3,
+      maxLength: 180
+    });
+    if (queryTypeError) {
+      return respondPhase3ValidationError(res, queryTypeError);
+    }
+
+    const contextTypeError = validateStringValue(req.body.contextText, {
+      fieldName: "contextText",
+      required: false,
+      maxLength: 220
+    });
+    if (contextTypeError) {
+      return respondPhase3ValidationError(res, contextTypeError);
+    }
+
+    const query = normalizePlaceQuery(req.body.query);
+    const contextText = normalizePlaceQuery(req.body.contextText);
 
     if (!GOOGLE_PLACES_API_KEY) {
       return res.status(500).json({ error: "Google Places is not configured." });
-    }
-
-    if (query.length < 3 || query.length > 180) {
-      return res.status(400).json({ error: "query must be between 3 and 180 characters." });
-    }
-
-    if (contextText.length > 220) {
-      return res.status(400).json({ error: "contextText is too long." });
     }
 
     const rawSuggestions = await fetchGooglePlacePredictions(query, contextText);
@@ -1060,23 +1379,86 @@ app.post("/place_autosuggest", requireFirebaseIdToken, async (req, res) => {
       items
     });
   } catch (err) {
-    console.error("âŒ /place_autosuggest failed:", err);
+    console.error("❌ /place_autosuggest failed:", err);
     return res.status(500).json({ error: "Place suggestions are unavailable right now." });
   }
 });
 
 // --------------------------------------------------
-// GOOGLE ROUTES â€” DISTANCE ROUTE PLANNER
+// GOOGLE ROUTES — DISTANCE ROUTE PLANNER
 // Selected Google Places predictions use Place IDs.
 // Free-typed entries fall back to address strings.
 // Stop order is preserved; Pro waypoint optimization is not enabled.
 // --------------------------------------------------
-app.post("/route_compute", requireFirebaseIdToken, async (req, res) => {
+app.post(
+  "/route_compute",
+  phase3NetworkGate,
+  requireFirebaseIdToken,
+  phase3UserGate,
+  ...phase3RouteComputeLimits,
+  async (req, res) => {
   try {
-    const start = req.body?.start || {};
-    const end = req.body?.end || {};
-    const rawStops = Array.isArray(req.body?.stops) ? req.body.stops : [];
-    const contextText = normalizePlaceQuery(req.body?.contextText);
+    const bodyShapeError = validateAllowedKeys(
+      req.body,
+      ["start", "end", "stops", "contextText"]
+    );
+    if (bodyShapeError) {
+      return respondPhase3ValidationError(res, bodyShapeError);
+    }
+
+    const startError = validateRouteLocationObject(
+      req.body.start,
+      "start"
+    );
+    if (startError) {
+      return respondPhase3ValidationError(res, startError);
+    }
+
+    const endError = validateRouteLocationObject(
+      req.body.end,
+      "end"
+    );
+    if (endError) {
+      return respondPhase3ValidationError(res, endError);
+    }
+
+    if (!Array.isArray(req.body.stops)) {
+      return respondPhase3ValidationError(
+        res,
+        "stops must be an array."
+      );
+    }
+
+    if (req.body.stops.length < 1 || req.body.stops.length > 50) {
+      return respondPhase3ValidationError(
+        res,
+        "stops must contain between 1 and 50 items."
+      );
+    }
+
+    for (let index = 0; index < req.body.stops.length; index += 1) {
+      const stopError = validateRouteLocationObject(
+        req.body.stops[index],
+        `stops[${index}]`
+      );
+      if (stopError) {
+        return respondPhase3ValidationError(res, stopError);
+      }
+    }
+
+    const contextError = validateStringValue(req.body.contextText, {
+      fieldName: "contextText",
+      required: false,
+      maxLength: 240
+    });
+    if (contextError) {
+      return respondPhase3ValidationError(res, contextError);
+    }
+
+    const start = req.body.start;
+    const end = req.body.end;
+    const rawStops = req.body.stops;
+    const contextText = normalizePlaceQuery(req.body.contextText);
 
     if (!GOOGLE_PLACES_API_KEY) {
       return res.status(500).json({ error: "Google Maps Platform is not configured." });
@@ -1084,34 +1466,19 @@ app.post("/route_compute", requireFirebaseIdToken, async (req, res) => {
 
     const startText = routeInputText(start);
     const endText = routeInputText(end);
-    if (!startText || !endText || rawStops.length < 1) {
-      return res.status(400).json({ error: "Start, end, and at least one stop are required." });
-    }
-
-    if (startText.length > 240 || endText.length > 240 || contextText.length > 240) {
-      return res.status(400).json({ error: "Route location text is too long." });
-    }
-
-    if (rawStops.length > 50) {
-      return res.status(400).json({ error: "A maximum of 50 stops is supported." });
-    }
 
     const stops = rawStops.map((value) => ({
-      text: routeInputText(value).slice(0, 240),
-      placeId: routeInputPlaceId(value).slice(0, 180)
+      text: routeInputText(value),
+      placeId: routeInputPlaceId(value)
     }));
-
-    if (stops.some((stop) => !stop.text)) {
-      return res.status(400).json({ error: "Every route stop needs a name or address." });
-    }
 
     const normalizedStart = {
       text: startText,
-      placeId: routeInputPlaceId(start).slice(0, 180)
+      placeId: routeInputPlaceId(start)
     };
     const normalizedEnd = {
       text: endText,
-      placeId: routeInputPlaceId(end).slice(0, 180)
+      placeId: routeInputPlaceId(end)
     };
 
     const allPoints = [normalizedStart, ...stops, normalizedEnd];
@@ -1128,7 +1495,7 @@ app.post("/route_compute", requireFirebaseIdToken, async (req, res) => {
       segmentCount: computed.segmentCount
     });
   } catch (err) {
-    console.error("âŒ /route_compute failed:", err);
+    console.error("❌ /route_compute failed:", err);
     return res.status(502).json({ error: "Google route calculation is unavailable right now." });
   }
 });
@@ -1136,15 +1503,25 @@ app.post("/route_compute", requireFirebaseIdToken, async (req, res) => {
 // --------------------------------------------------
 // MINI-BRAIN GENERATE ENDPOINT (MAIN ENDPOINT)
 // --------------------------------------------------
-app.post("/generate", requireFirebaseIdToken, async (req, res) => {
+app.post(
+  "/generate",
+  phase3NetworkGate,
+  requireFirebaseIdToken,
+  phase3UserGate,
+  ...phase3GenerateLimits,
+  async (req, res) => {
   try {
-    const { prompt } = req.body;
-
-    if (!prompt) {
-      return res.status(400).json({ error: "Missing 'prompt' in request body." });
+    const validationError = validateSimplePromptBody(
+      req.body,
+      48000
+    );
+    if (validationError) {
+      return respondPhase3ValidationError(res, validationError);
     }
 
-    console.log("ðŸ“© Incoming prompt:", prompt.substring(0, 200) + "...");
+    const prompt = req.body.prompt;
+
+    console.log("📩 Incoming prompt:", prompt.substring(0, 200) + "...");
 
     const completion = await client.chat.completions.create({
       model: "gpt-4.1-mini",
@@ -1155,11 +1532,11 @@ app.post("/generate", requireFirebaseIdToken, async (req, res) => {
     });
 
     const output = completion.choices?.[0]?.message?.content || "";
-    console.log("ðŸ“¤ Output length:", output.length);
+    console.log("📤 Output length:", output.length);
 
     return res.json({ result: output });
   } catch (err) {
-    console.error("âŒ /generate failed:", err);
+    console.error("❌ /generate failed:", err);
     return res.status(500).json({ error: "AI generation failed", details: err.message });
   }
 });
@@ -1169,18 +1546,25 @@ app.post("/generate", requireFirebaseIdToken, async (req, res) => {
 // Expects: { prompt: string }
 // Returns: strict JSON matching AgentSmithScreen parser
 // --------------------------------------------------
-app.post("/agent_smith", requireFirebaseIdToken, async (req, res) => {
+app.post(
+  "/agent_smith",
+  phase3NetworkGate,
+  requireFirebaseIdToken,
+  phase3UserGate,
+  ...phase3AgentSmithLimits,
+  async (req, res) => {
   try {
-    const { prompt } = req.body;
-
-    if (!prompt) {
-      return res.status(400).json({
-        error: true,
-        message: "Missing 'prompt' in request body."
-      });
+    const validationError = validateSimplePromptBody(
+      req.body,
+      36000
+    );
+    if (validationError) {
+      return respondPhase3ValidationError(res, validationError);
     }
 
-    console.log("ðŸ•µï¸ /agent_smith prompt head:", prompt.substring(0, 200) + "...");
+    const prompt = req.body.prompt;
+
+    console.log("🕵️ /agent_smith prompt head:", prompt.substring(0, 200) + "...");
 
     const completion = await client.chat.completions.create({
       model: "gpt-4.1-mini",
@@ -1192,7 +1576,7 @@ app.post("/agent_smith", requireFirebaseIdToken, async (req, res) => {
     });
 
     const raw = completion.choices?.[0]?.message?.content || "";
-    console.log("ðŸ§¾ /agent_smith raw length:", raw.length);
+    console.log("🧾 /agent_smith raw length:", raw.length);
 
     let parsed;
     try {
@@ -1255,7 +1639,7 @@ app.post("/agent_smith", requireFirebaseIdToken, async (req, res) => {
 
     return res.json(parsed);
   } catch (err) {
-    console.error("âŒ /agent_smith failed:", err);
+    console.error("❌ /agent_smith failed:", err);
     return res.status(500).json({
       error: true,
       message: "Agent Smith generation failed",
@@ -1269,19 +1653,34 @@ app.post("/agent_smith", requireFirebaseIdToken, async (req, res) => {
 // Expects: { query: string }
 // Returns: { results: EvidenceItem[] }
 // --------------------------------------------------
-app.post("/evidence_search", requireFirebaseIdToken, async (req, res) => {
+app.post(
+  "/evidence_search",
+  phase3NetworkGate,
+  requireFirebaseIdToken,
+  phase3UserGate,
+  ...phase3EvidenceSearchLimits,
+  async (req, res) => {
   try {
-    const { query } = req.body;
-
-    if (!query || typeof query !== "string") {
-      return res.status(400).json({
-        error: true,
-        message: "Missing 'query' in request body."
-      });
+    const bodyShapeError = validateAllowedKeys(
+      req.body,
+      ["query"]
+    );
+    if (bodyShapeError) {
+      return respondPhase3ValidationError(res, bodyShapeError);
     }
 
-    const q = query.trim();
-    console.log("ðŸ”Ž /evidence_search query:", q);
+    const queryError = validateStringValue(req.body.query, {
+      fieldName: "query",
+      required: true,
+      minLength: 2,
+      maxLength: 600
+    });
+    if (queryError) {
+      return respondPhase3ValidationError(res, queryError);
+    }
+
+    const q = req.body.query.trim();
+    console.log("🔎 /evidence_search query:", q);
     console.log("   SerpApi key present?", !!SERPAPI_API_KEY);
 
     if (!SERPAPI_API_KEY) {
@@ -1302,7 +1701,7 @@ app.post("/evidence_search", requireFirebaseIdToken, async (req, res) => {
 
     if (!resp.ok) {
       const bodyText = await resp.text().catch(() => "");
-      console.error("âŒ SerpApi fetch failed:", resp.status, resp.statusText, bodyText);
+      console.error("❌ SerpApi fetch failed:", resp.status, resp.statusText, bodyText);
       return res.status(500).json({
         error: true,
         message: "Evidence search failed (SerpApi error).",
@@ -1322,7 +1721,7 @@ app.post("/evidence_search", requireFirebaseIdToken, async (req, res) => {
       const domain = extractDomain(link);
       const source = domain || null;
 
-      // âœ… Step 1: Pass through favicon when SerpApi provides it
+      // ✅ Step 1: Pass through favicon when SerpApi provides it
       const favicon = safeString(item.favicon || item.favicon_url || item.faviconUrl);
 
       return {
@@ -1349,10 +1748,10 @@ app.post("/evidence_search", requireFirebaseIdToken, async (req, res) => {
       });
     }
 
-    console.log("âœ… /evidence_search (SerpApi DDG) results:", results.length);
+    console.log("✅ /evidence_search (SerpApi DDG) results:", results.length);
     return res.json({ results });
   } catch (err) {
-    console.error("âŒ /evidence_search failed:", err);
+    console.error("❌ /evidence_search failed:", err);
     return res.status(500).json({
       error: true,
       message: "Evidence search failed",
@@ -1375,5 +1774,5 @@ app.post("/test", (req, res) => {
 // START SERVER
 // --------------------------------------------------
 app.listen(PORT, () => {
-  console.log(`âœ… HelloAI server listening on port ${PORT}`);
+  console.log(`✅ HelloAI server listening on port ${PORT}`);
 });
