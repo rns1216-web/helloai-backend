@@ -1,4 +1,11 @@
 // LinkLyfe drop-in replacement
+// Route Planner Google Places + Google Routes v6.
+// Selected Place IDs route directly through Google Routes; HERE is no longer used by Route Planner.
+// Phase 2 Firebase auth remains fail-closed and unchanged.
+// LinkLyfe drop-in replacement
+// Route Planner Google Places Autocomplete v5.
+// Preserves Phase 2 Firebase auth, HERE route geocoding, and normal-mode routing repair.
+// LinkLyfe drop-in replacement
 // Route Planner HERE Autosuggest v4.
 // Preserves Phase 2 Firebase auth and the normal-mode Route Planner regional-routing repair.
 // LinkLyfe drop-in replacement
@@ -64,6 +71,7 @@ if (!process.env.OPENAI_API_KEY) {
 // SerpApi (DuckDuckGo) key for Evidence Search
 const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY;
 const HERE_API_KEY = process.env.HERE_API_KEY || "";
+// Shared restricted Google Maps Platform key: Places API (New) + Routes API only.\nconst GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || "";
 const routeGeocodeCache = new Map();
 
 const client = new OpenAI({
@@ -761,75 +769,247 @@ function credibilityScoreFor(url, source) {
 }
 
 
-function routeSuggestionText(item) {
-  const title = safeString(item?.title).trim();
-  const addressLabel = safeString(item?.address?.label).trim();
+function googleAutocompleteContextTail(contextText) {
+  const parts = normalizePlaceQuery(contextText)
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
 
-  if (!title) return addressLabel;
-  if (!addressLabel) return title;
-
-  const normalizedTitle = normalizeComparableText(title);
-  const normalizedAddress = normalizeComparableText(addressLabel);
-  if (normalizedTitle && normalizedAddress.includes(normalizedTitle)) {
-    return addressLabel;
-  }
-  return `${title}, ${addressLabel}`;
+  if (parts.length >= 3) return parts.slice(-3).join(", ");
+  if (parts.length >= 2) return parts.slice(-2).join(", ");
+  return "";
 }
 
-function routeSuggestionSubtitle(item) {
-  const title = safeString(item?.title).trim();
-  const addressLabel = safeString(item?.address?.label).trim();
+function googleAutocompleteInput(query, contextText) {
+  const cleanedQuery = normalizePlaceQuery(query);
+  const tail = googleAutocompleteContextTail(contextText);
 
-  if (addressLabel && normalizeComparableText(addressLabel) !== normalizeComparableText(title)) {
-    return addressLabel;
+  if (!tail) return cleanedQuery;
+
+  const normalizedQuery = normalizeComparableText(cleanedQuery);
+  const normalizedTail = normalizeComparableText(tail);
+
+  // Avoid duplicating region words the user already typed.
+  if (normalizedTail && normalizedQuery.includes(normalizedTail)) {
+    return cleanedQuery;
   }
 
-  const address = item?.address || {};
-  return [
-    safeString(address.city || address.district || address.county).trim(),
-    safeString(address.stateCode || address.state).trim(),
-    safeString(address.countryName || address.countryCode).trim()
-  ].filter(Boolean).join(", ");
+  return `${cleanedQuery}, ${tail}`;
 }
 
-async function fetchHereAutosuggest(query, anchor, limit = 5) {
-  if (!HERE_API_KEY) {
-    throw new Error("Missing HERE_API_KEY in environment.");
-  }
-  if (!anchor || typeof anchor.lat !== "number" || typeof anchor.lng !== "number") {
-    return [];
+async function fetchGooglePlacePredictions(query, contextText) {
+  if (!GOOGLE_PLACES_API_KEY) {
+    throw new Error("Missing GOOGLE_PLACES_API_KEY in environment.");
   }
 
-  const url =
-    `https://autosuggest.search.hereapi.com/v1/autosuggest` +
-    `?at=${encodeURIComponent(`${anchor.lat},${anchor.lng}`)}` +
-    `&limit=${encodeURIComponent(String(Math.max(1, Math.min(limit, 5))))}` +
-    `&q=${encodeURIComponent(query)}` +
-    `&apiKey=${encodeURIComponent(HERE_API_KEY)}`;
+  const input = googleAutocompleteInput(query, contextText);
+  const response = await fetch(
+    "https://places.googleapis.com/v1/places:autocomplete",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask": [
+          "suggestions.placePrediction.placeId",
+          "suggestions.placePrediction.text.text",
+          "suggestions.placePrediction.structuredFormat.mainText.text",
+          "suggestions.placePrediction.structuredFormat.secondaryText.text"
+        ].join(",")
+      },
+      body: JSON.stringify({
+        input,
+        includeQueryPredictions: false,
+        languageCode: "en"
+      })
+    }
+  );
 
-  const response = await fetch(url);
   if (!response.ok) {
-    throw new Error(`HERE autosuggest failed with status ${response.status}`);
+    throw new Error(`Google Places autocomplete failed with status ${response.status}`);
   }
 
   const data = await response.json();
-  return Array.isArray(data?.items) ? data.items : [];
+  return Array.isArray(data?.suggestions) ? data.suggestions : [];
 }
 
-async function resolveAutosuggestAnchor(query, contextText) {
-  const context = normalizePlaceQuery(contextText);
+function googlePlaceSuggestionFromPrediction(suggestion) {
+  const prediction = suggestion?.placePrediction;
+  if (!prediction) return null;
 
-  // Once the user has a Start point (or Journey destination), keep suggestions
-  // centered around that trip region instead of around the phone's location.
-  if (context) {
-    const contextPoint = await geocodeSingleWithHere(context);
-    if (contextPoint?.resolved) return routeAnchorFromPoint(contextPoint);
+  const placeId = safeString(prediction?.placeId).trim();
+  const title = safeString(prediction?.structuredFormat?.mainText?.text).trim();
+  const subtitle = safeString(prediction?.structuredFormat?.secondaryText?.text).trim();
+  const fullText = safeString(prediction?.text?.text).trim();
+
+  if (!placeId || (!title && !fullText)) return null;
+
+  return {
+    id: placeId,
+    title: title || fullText,
+    subtitle,
+    selectionText: fullText || [title, subtitle].filter(Boolean).join(", "),
+    lat: null,
+    lng: null
+  };
+}
+
+
+function routeInputText(value) {
+  return safeString(value?.text).trim();
+}
+
+function routeInputPlaceId(value) {
+  return safeString(value?.placeId).trim();
+}
+
+function googleRouteWaypoint(value, contextText = "") {
+  const placeId = routeInputPlaceId(value);
+  if (placeId) return { placeId };
+
+  let address = routeInputText(value);
+  const context = safeString(contextText).trim();
+
+  if (address && context) {
+    const comparableAddress = normalizeComparableText(address);
+    const comparableContext = normalizeComparableText(context);
+    if (comparableContext && !comparableAddress.includes(comparableContext)) {
+      address = `${address}, ${context}`;
+    }
   }
 
-  // First field has no trip context yet. Use HERE geocode only to establish
-  // an approximate search center; the user still chooses the actual suggestion.
-  const queryPoint = await geocodeSingleWithHere(query);
-  return queryPoint?.resolved ? routeAnchorFromPoint(queryPoint) : null;
+  return address ? { address } : null;
+}
+
+function parseGoogleDurationSeconds(raw) {
+  const value = safeString(raw).trim();
+  if (!value.endsWith("s")) return null;
+  const seconds = Number(value.slice(0, -1));
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
+}
+
+function routePointResponse(value) {
+  const text = routeInputText(value);
+  const placeId = routeInputPlaceId(value);
+  return {
+    query: text,
+    shortName: text.split(",")[0]?.trim() || text,
+    displayName: text,
+    placeId,
+    resolved: true,
+    lat: null,
+    lng: null
+  };
+}
+
+async function fetchGoogleRouteSegment(points, contextText = "") {
+  if (!GOOGLE_PLACES_API_KEY) {
+    throw new Error("Google Maps Platform is not configured.");
+  }
+  if (!Array.isArray(points) || points.length < 2) {
+    throw new Error("A route segment needs at least two points.");
+  }
+
+  const origin = googleRouteWaypoint(points[0], contextText);
+  const destination = googleRouteWaypoint(points[points.length - 1], contextText);
+  const intermediates = points
+    .slice(1, -1)
+    .map((point) => googleRouteWaypoint(point, contextText))
+    .filter(Boolean);
+
+  if (!origin || !destination) {
+    throw new Error("Route origin and destination are required.");
+  }
+
+  const response = await fetch(
+    "https://routes.googleapis.com/directions/v2:computeRoutes",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask": [
+          "routes.distanceMeters",
+          "routes.duration",
+          "routes.legs.distanceMeters",
+          "routes.legs.duration"
+        ].join(",")
+      },
+      body: JSON.stringify({
+        origin,
+        destination,
+        intermediates,
+        travelMode: "DRIVE",
+        computeAlternativeRoutes: false
+      })
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Google Routes failed with status ${response.status}`);
+  }
+
+  const data = await response.json();
+  const route = Array.isArray(data?.routes) ? data.routes[0] : null;
+  if (!route) {
+    throw new Error("Google Routes returned no route.");
+  }
+
+  const legs = Array.isArray(route?.legs)
+    ? route.legs.map((leg) => ({
+        distanceMeters:
+          typeof leg?.distanceMeters === "number" && Number.isFinite(leg.distanceMeters)
+            ? Math.max(0, Math.round(leg.distanceMeters))
+            : null,
+        durationSeconds: parseGoogleDurationSeconds(leg?.duration)
+      }))
+    : [];
+
+  return {
+    legs,
+    distanceMeters:
+      typeof route?.distanceMeters === "number" && Number.isFinite(route.distanceMeters)
+        ? Math.max(0, Math.round(route.distanceMeters))
+        : legs.reduce((sum, leg) => sum + (leg.distanceMeters || 0), 0),
+    durationSeconds:
+      parseGoogleDurationSeconds(route?.duration) ??
+      legs.reduce((sum, leg) => sum + (leg.durationSeconds || 0), 0)
+  };
+}
+
+async function computeGoogleOrderedRoute(allPoints, contextText = "") {
+  const MAX_POINTS_PER_ESSENTIALS_REQUEST = 12;
+  const allLegs = [];
+  let totalDistanceMeters = 0;
+  let totalDurationSeconds = 0;
+  let segmentCount = 0;
+
+  let startIndex = 0;
+  while (startIndex < allPoints.length - 1) {
+    const endIndex = Math.min(
+      allPoints.length - 1,
+      startIndex + MAX_POINTS_PER_ESSENTIALS_REQUEST - 1
+    );
+    const segmentPoints = allPoints.slice(startIndex, endIndex + 1);
+    const segment = await fetchGoogleRouteSegment(segmentPoints, contextText);
+
+    allLegs.push(...segment.legs);
+    totalDistanceMeters += segment.distanceMeters || 0;
+    totalDurationSeconds += segment.durationSeconds || 0;
+    segmentCount += 1;
+    startIndex = endIndex;
+  }
+
+  if (allLegs.length !== allPoints.length - 1) {
+    throw new Error("Google Routes returned an unexpected leg count.");
+  }
+
+  return {
+    legs: allLegs,
+    totalDistanceMeters,
+    totalDurationSeconds,
+    segmentCount
+  };
 }
 
 // --------------------------------------------------
@@ -840,9 +1020,9 @@ app.get("/", (req, res) => {
 });
 
 // --------------------------------------------------
-// HERE PLACE AUTOSUGGEST (DISTANCE ROUTE PLANNER)
+// GOOGLE PLACES AUTOCOMPLETE (DISTANCE ROUTE PLANNER)
 // Expects: { query: string, contextText?: string }
-// Returns only HERE entity/location items that include coordinates.
+// Returns Google place predictions only; no Place Details request is made.
 // Free-form typing remains valid if no suggestion is selected.
 // --------------------------------------------------
 app.post("/place_autosuggest", requireFirebaseIdToken, async (req, res) => {
@@ -850,8 +1030,8 @@ app.post("/place_autosuggest", requireFirebaseIdToken, async (req, res) => {
     const query = normalizePlaceQuery(req.body?.query);
     const contextText = normalizePlaceQuery(req.body?.contextText);
 
-    if (!HERE_API_KEY) {
-      return res.status(500).json({ error: "Missing HERE_API_KEY in environment." });
+    if (!GOOGLE_PLACES_API_KEY) {
+      return res.status(500).json({ error: "Google Places is not configured." });
     }
 
     if (query.length < 3 || query.length > 180) {
@@ -862,43 +1042,17 @@ app.post("/place_autosuggest", requireFirebaseIdToken, async (req, res) => {
       return res.status(400).json({ error: "contextText is too long." });
     }
 
-    const anchor = await resolveAutosuggestAnchor(query, contextText);
-    if (!anchor) {
-      return res.json({ provider: "here", items: [] });
-    }
-
-    const rawItems = await fetchHereAutosuggest(query, anchor, 5);
+    const rawSuggestions = await fetchGooglePlacePredictions(query, contextText);
     const items = [];
 
-    for (const item of rawItems) {
+    for (const suggestion of rawSuggestions) {
       if (items.length >= 5) break;
-
-      const lat = item?.position?.lat;
-      const lng = item?.position?.lng;
-      if (typeof lat !== "number" || typeof lng !== "number") continue;
-
-      // Autosuggest may also return categoryQuery/chainQuery/query suggestions.
-      // Route Planner needs an actual selectable geographic entity.
-      const resultType = safeString(item?.resultType).trim();
-      if (["categoryQuery", "chainQuery", "query"].includes(resultType)) continue;
-
-      const title = safeString(item?.title).trim();
-      const selectionText = routeSuggestionText(item).trim();
-      if (!title && !selectionText) continue;
-
-      items.push({
-        id: safeString(item?.id).trim(),
-        title: title || selectionText,
-        subtitle: routeSuggestionSubtitle(item),
-        selectionText: selectionText || title,
-        lat,
-        lng,
-        resultType
-      });
+      const item = googlePlaceSuggestionFromPrediction(suggestion);
+      if (item) items.push(item);
     }
 
     return res.json({
-      provider: "here",
+      provider: "google_maps",
       items
     });
   } catch (err) {
@@ -908,63 +1062,70 @@ app.post("/place_autosuggest", requireFirebaseIdToken, async (req, res) => {
 });
 
 // --------------------------------------------------
-// HERE GEOCODE BATCH ENDPOINT (DISTANCE ROUTE PLANNER)
-// Expects: { startText: string, endText: string, stopTexts: string[] }
-// Returns: resolved names + lat/lng for Haversine distance math on the client
+// GOOGLE ROUTES — DISTANCE ROUTE PLANNER
+// Selected Google Places predictions use Place IDs.
+// Free-typed entries fall back to address strings.
+// Stop order is preserved; Pro waypoint optimization is not enabled.
 // --------------------------------------------------
-app.post("/geocode_batch", requireFirebaseIdToken, async (req, res) => {
+app.post("/route_compute", requireFirebaseIdToken, async (req, res) => {
   try {
-    const { startText, endText, stopTexts } = req.body || {};
-    if (!HERE_API_KEY) {
-      return res.status(500).json({ error: "Missing HERE_API_KEY in environment." });
+    const start = req.body?.start || {};
+    const end = req.body?.end || {};
+    const rawStops = Array.isArray(req.body?.stops) ? req.body.stops : [];
+    const contextText = normalizePlaceQuery(req.body?.contextText);
+
+    if (!GOOGLE_PLACES_API_KEY) {
+      return res.status(500).json({ error: "Google Maps Platform is not configured." });
     }
 
-    const stops = Array.isArray(stopTexts)
-      ? stopTexts.map((x) => normalizePlaceQuery(x)).filter(Boolean)
-      : [];
-
-    if (!safeString(startText).trim() || !safeString(endText).trim() || !stops.length) {
-      return res.status(400).json({ error: "startText, endText, and stopTexts[] are required." });
+    const startText = routeInputText(start);
+    const endText = routeInputText(end);
+    if (!startText || !endText || rawStops.length < 1) {
+      return res.status(400).json({ error: "Start, end, and at least one stop are required." });
     }
 
-    // NORMAL MODE FIRST:
-    // Infer one trustworthy regional anchor from the route inputs themselves.
-    // This prevents generic names such as "Clifton Hill" or "Hornblower" from
-    // silently resolving to unrelated places in other states/countries.
-    const inferredAnchor = await inferRouteRegionAnchor(startText, endText, stops);
-
-    const [start, end] = await Promise.all([
-      geocodeSingleWithHere(startText, { anchor: inferredAnchor }),
-      geocodeSingleWithHere(endText, { anchor: inferredAnchor })
-    ]);
-
-    const endpointAnchor = inferAnchorContext(start, end);
-    const anchor = inferredAnchor || endpointAnchor;
-
-    const resolvedStops = [];
-    for (const stop of stops) {
-      // Preserve the user's list order exactly.
-      resolvedStops.push(await geocodeSingleWithHere(stop, { anchor }));
+    if (startText.length > 240 || endText.length > 240 || contextText.length > 240) {
+      return res.status(400).json({ error: "Route location text is too long." });
     }
+
+    if (rawStops.length > 50) {
+      return res.status(400).json({ error: "A maximum of 50 stops is supported." });
+    }
+
+    const stops = rawStops.map((value) => ({
+      text: routeInputText(value).slice(0, 240),
+      placeId: routeInputPlaceId(value).slice(0, 180)
+    }));
+
+    if (stops.some((stop) => !stop.text)) {
+      return res.status(400).json({ error: "Every route stop needs a name or address." });
+    }
+
+    const normalizedStart = {
+      text: startText,
+      placeId: routeInputPlaceId(start).slice(0, 180)
+    };
+    const normalizedEnd = {
+      text: endText,
+      placeId: routeInputPlaceId(end).slice(0, 180)
+    };
+
+    const allPoints = [normalizedStart, ...stops, normalizedEnd];
+    const computed = await computeGoogleOrderedRoute(allPoints, contextText);
 
     return res.json({
-      provider: "here",
-      routeContext: anchor
-        ? {
-            city: anchor.city || "",
-            stateCode: anchor.stateCode || "",
-            state: anchor.state || "",
-            countryCode: anchor.countryCode || "",
-            countryName: anchor.countryName || ""
-          }
-        : null,
-      start,
-      end,
-      stops: resolvedStops
+      provider: "google_routes",
+      start: routePointResponse(normalizedStart),
+      end: routePointResponse(normalizedEnd),
+      stops: stops.map(routePointResponse),
+      legs: computed.legs,
+      totalDistanceMeters: computed.totalDistanceMeters,
+      totalDurationSeconds: computed.totalDurationSeconds,
+      segmentCount: computed.segmentCount
     });
   } catch (err) {
-    console.error("❌ /geocode_batch failed:", err);
-    return res.status(500).json({ error: "Geocode batch failed", details: err.message });
+    console.error("❌ /route_compute failed:", err);
+    return res.status(502).json({ error: "Google route calculation is unavailable right now." });
   }
 });
 
