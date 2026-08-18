@@ -1,3 +1,8 @@
+// LinkLyfe Phase 4 backend hardening v9
+// Removes user-content logging, adds request metadata logging + request IDs,
+// generic public error responses, deliberate CORS, security headers,
+// removes the public test route, and deletes unused HERE Route Planner code.
+// Phase 2 Firebase auth and Phase 3 rate limits/validation remain unchanged.
 // LinkLyfe Phase 3 security hardening v8
 // Adds bounded JSON parsing, authenticated UID + network rate limits,
 // expensive-endpoint burst/sustained limits, and strict request validation.
@@ -26,6 +31,7 @@ const dotenv = require("dotenv");
 const { OpenAI } = require("openai");
 const { initializeApp, applicationDefault, cert, getApps } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
+const { randomUUID } = require("crypto");
 
 // Load .env variables
 dotenv.config();
@@ -77,10 +83,8 @@ if (!process.env.OPENAI_API_KEY) {
 
 // SerpApi (DuckDuckGo) key for Evidence Search
 const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY;
-const HERE_API_KEY = process.env.HERE_API_KEY || "";
 // Shared restricted Google Maps Platform key: Places API (New) + Routes API only.
 const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || "";
-const routeGeocodeCache = new Map();
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
@@ -89,7 +93,122 @@ const client = new OpenAI({
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+// --------------------------------------------------
+// PHASE 4 — RESPONSE SECURITY + SAFE REQUEST LOGGING
+// --------------------------------------------------
+
+const defaultCorsOrigins = [
+  "https://linklyfe.com",
+  "https://www.linklyfe.com"
+];
+
+const configuredCorsOrigins = String(process.env.CORS_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const allowedCorsOrigins = new Set([
+  ...defaultCorsOrigins,
+  ...configuredCorsOrigins
+]);
+
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader(
+    "Permissions-Policy",
+    "camera=(), microphone=(), geolocation=()"
+  );
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+  );
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader(
+    "Strict-Transport-Security",
+    "max-age=31536000; includeSubDomains"
+  );
+  next();
+});
+
+app.use((req, res, next) => {
+  const requestId = randomUUID();
+  const startedAt = process.hrtime.bigint();
+
+  req.linklyfeRequestId = requestId;
+  res.setHeader("X-Request-Id", requestId);
+
+  res.on("finish", () => {
+    const elapsedNs = process.hrtime.bigint() - startedAt;
+    const durationMs = Number(elapsedNs / 1000000n);
+
+    console.log(JSON.stringify({
+      event: "request_complete",
+      requestId,
+      method: req.method,
+      route: req.path,
+      status: res.statusCode,
+      durationMs
+    }));
+  });
+
+  next();
+});
+
+app.use(cors({
+  origin(origin, callback) {
+    // Native Android/server-to-server requests normally have no Origin header.
+    if (!origin) return callback(null, true);
+    return callback(null, allowedCorsOrigins.has(origin));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  exposedHeaders: ["X-Request-Id"],
+  credentials: false,
+  maxAge: 600
+}));
+
+function safeBackendErrorMeta(err) {
+  const rawCode =
+    typeof err?.code === "string" || typeof err?.code === "number"
+      ? String(err.code).slice(0, 80)
+      : "";
+
+  let upstreamStatus = null;
+  const directStatus = Number(
+    err?.status ??
+    err?.statusCode ??
+    err?.response?.status
+  );
+
+  if (Number.isFinite(directStatus) && directStatus >= 100 && directStatus <= 599) {
+    upstreamStatus = directStatus;
+  } else {
+    const message = typeof err?.message === "string" ? err.message : "";
+    const match = message.match(/\b([45]\d{2})\b/);
+    if (match) upstreamStatus = Number(match[1]);
+  }
+
+  return {
+    errorName:
+      typeof err?.name === "string"
+        ? err.name.slice(0, 80)
+        : "Error",
+    errorCode: rawCode || undefined,
+    upstreamStatus: upstreamStatus || undefined
+  };
+}
+
+function logBackendError(req, event, err, extra = {}) {
+  console.error(JSON.stringify({
+    event,
+    requestId: req?.linklyfeRequestId || "startup",
+    route: req?.path || "",
+    ...safeBackendErrorMeta(err),
+    ...extra
+  }));
+}
 
 // Phase 3: bound request bodies before any expensive work.
 // 96 KB comfortably covers current LinkLyfe prompts/forms while preventing
@@ -432,21 +551,6 @@ function extractDomain(url) {
   }
 }
 
-function decodeHtmlEntities(str) {
-  return safeString(str)
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&nbsp;/g, " ")
-    .trim();
-}
-
-function stripTags(str) {
-  return safeString(str).replace(/<[^>]*>/g, "").trim();
-}
-
 function normalizePlaceQuery(text) {
   return safeString(text).replace(/\s+/g, " ").trim();
 }
@@ -465,562 +569,6 @@ function tokenizeComparableText(text) {
     .split(" ")
     .map((x) => x.trim())
     .filter(Boolean);
-}
-
-function buildHereDisplayNames(item) {
-  const title = safeString(item?.title).trim() || safeString(item?.address?.label).trim() || "Unknown place";
-  const address = item?.address || {};
-  const city = safeString(address.city || address.county || address.district).trim();
-  const state = safeString(address.stateCode || address.state).trim();
-  const country = safeString(address.countryCode || address.countryName).trim();
-  const suffix = [city, state || country].filter(Boolean).join(", ");
-  return {
-    shortName: title,
-    displayName: suffix ? `${title} — ${suffix}` : title
-  };
-}
-
-function canonicalRouteDisplayName(rawQuery, anchor) {
-  const q = normalizeComparableText(rawQuery);
-  const anchorCity = normalizeComparableText(anchor?.city || "");
-  const isChicago = anchorCity === "chicago";
-
-  if (isChicago) {
-    const canon = {
-      "millennium park": "Millennium Park",
-      "park millennium": "Millennium Park",
-      "art institute": "Art Institute of Chicago",
-      "art institute of chicago": "Art Institute of Chicago",
-      "the bean": "Cloud Gate (The Bean)",
-      "cloud gate": "Cloud Gate (The Bean)",
-      "shedd aquarium": "Shedd Aquarium",
-      "aquarium": "Shedd Aquarium",
-      "john g shedd aquarium": "Shedd Aquarium",
-      "lincoln park zoo": "Lincoln Park Zoo",
-      "lincoln park": "Lincoln Park Zoo",
-      "chicago riverwalk": "Chicago Riverwalk",
-      "riverwalk": "Chicago Riverwalk",
-      "wicker park": "Wicker Park",
-      "portillos": "Portillo's",
-      "portillos chicago": "Portillo's",
-      "portillo s": "Portillo's",
-      "portillo's": "Portillo's"
-    };
-    if (canon[q]) return canon[q];
-  }
-
-  return "";
-}
-
-function getHereAddressBits(item) {
-  const address = item?.address || {};
-  return {
-    city: safeString(address.city || address.county || address.district).trim(),
-    stateCode: safeString(address.stateCode).trim(),
-    state: safeString(address.state).trim(),
-    countryCode: safeString(address.countryCode).trim(),
-    countryName: safeString(address.countryName).trim()
-  };
-}
-
-function haversineMiles(lat1, lng1, lat2, lng2) {
-  if (
-    typeof lat1 !== "number" ||
-    typeof lng1 !== "number" ||
-    typeof lat2 !== "number" ||
-    typeof lng2 !== "number"
-  ) {
-    return null;
-  }
-  const toRad = (deg) => (deg * Math.PI) / 180;
-  const R = 3958.7613;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function inferAnchorContext(start, end) {
-  const a = start?.resolved ? start : null;
-  const b = end?.resolved ? end : null;
-  if (!a && !b) return null;
-
-  const sameCountry =
-    a && b &&
-    a.countryCode &&
-    b.countryCode &&
-    normalizeComparableText(a.countryCode) === normalizeComparableText(b.countryCode);
-
-  const sameState =
-    a && b &&
-    sameCountry &&
-    (
-      (a.stateCode && b.stateCode && normalizeComparableText(a.stateCode) === normalizeComparableText(b.stateCode)) ||
-      (a.state && b.state && normalizeComparableText(a.state) === normalizeComparableText(b.state))
-    );
-
-  const sameCity =
-    a && b &&
-    sameCountry &&
-    a.city &&
-    b.city &&
-    normalizeComparableText(a.city) === normalizeComparableText(b.city);
-
-  const primary = a || b;
-  const secondary = b || a;
-
-  return {
-    city: (sameCity && (a?.city || b?.city)) || primary?.city || secondary?.city || "",
-    stateCode: (sameState && (a?.stateCode || b?.stateCode)) || primary?.stateCode || secondary?.stateCode || "",
-    state: (sameState && (a?.state || b?.state)) || primary?.state || secondary?.state || "",
-    countryCode: primary?.countryCode || secondary?.countryCode || "",
-    countryName: primary?.countryName || secondary?.countryName || "",
-    lat: primary?.lat,
-    lng: primary?.lng
-  };
-}
-
-function applyRouteAlias(rawQuery, anchor) {
-  const q = normalizePlaceQuery(rawQuery);
-  const lower = normalizeComparableText(q);
-  const anchorCity = normalizeComparableText(anchor?.city || "");
-  const isChicago = anchorCity === "chicago";
-
-  const exactMap = {
-    "art institute": isChicago ? "Art Institute of Chicago" : q,
-    "the bean": isChicago ? "Cloud Gate" : q,
-    "union station east door": isChicago ? "Chicago Union Station East Entrance" : q,
-    "union station-east door": isChicago ? "Chicago Union Station East Entrance" : q,
-    "riverwalk": isChicago ? "Chicago Riverwalk" : q,
-    "chicago riverwalk": "Chicago Riverwalk"
-  };
-
-  if (exactMap[lower]) return exactMap[lower];
-
-  if (isChicago) {
-    if (lower in {"aquarium": 1, "shedd": 1, "shedd aquarium": 1}) return "Shedd Aquarium";
-    if (lower in {"lincoln park": 1}) return "Lincoln Park Chicago";
-    if (lower in {"portillos": 1, "portillos chicago": 1, "portillo's": 1, "portillos restaurant": 1}) return "Portillo's Chicago";
-  }
-
-  return q;
-}
-
-function buildQueryVariants(rawQuery, anchor) {
-  const base = applyRouteAlias(rawQuery, anchor);
-  const variants = [];
-  const pushVariant = (x) => {
-    const v = normalizePlaceQuery(x);
-    if (!v) return;
-    if (!variants.some((existing) => normalizeComparableText(existing) === normalizeComparableText(v))) {
-      variants.push(v);
-    }
-  };
-
-  pushVariant(rawQuery);
-  pushVariant(base);
-
-  if (anchor?.city) {
-    if (anchor?.stateCode) {
-      pushVariant(`${base}, ${anchor.city}, ${anchor.stateCode}`);
-    }
-    if (anchor?.state) {
-      pushVariant(`${base}, ${anchor.city}, ${anchor.state}`);
-    }
-    pushVariant(`${base}, ${anchor.city}`);
-  }
-
-  if (anchor?.countryCode) {
-    pushVariant(`${base}, ${anchor.countryCode}`);
-  }
-
-  return variants.slice(0, 5);
-}
-
-async function fetchHereGeocodeCandidates(query, limit = 5) {
-  if (!HERE_API_KEY) {
-    throw new Error("Missing HERE_API_KEY in environment.");
-  }
-  const url =
-    `https://geocode.search.hereapi.com/v1/geocode?q=${encodeURIComponent(query)}` +
-    `&limit=${encodeURIComponent(String(limit))}` +
-    `&apiKey=${encodeURIComponent(HERE_API_KEY)}`;
-
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`HERE geocode failed with status ${response.status}`);
-  }
-  const data = await response.json();
-  return Array.isArray(data.items) ? data.items : [];
-}
-
-function scoreHereCandidate(item, rawQuery, queryVariant, anchor) {
-  const names = buildHereDisplayNames(item);
-  const bits = getHereAddressBits(item);
-  const titleNorm = normalizeComparableText(names.shortName);
-  const rawNorm = normalizeComparableText(rawQuery);
-  const queryNorm = normalizeComparableText(queryVariant);
-
-  const titleTokens = new Set(tokenizeComparableText(names.shortName));
-  const rawTokens = tokenizeComparableText(rawQuery).filter((t) => t.length > 1);
-  const queryTokens = tokenizeComparableText(queryVariant).filter((t) => t.length > 1);
-
-  let score = 0;
-
-  if (titleNorm === rawNorm) score += 140;
-  if (titleNorm === queryNorm) score += 90;
-  if (titleNorm.includes(rawNorm) && rawNorm) score += 50;
-  if (titleNorm.includes(queryNorm) && queryNorm) score += 35;
-
-  for (const token of rawTokens) {
-    if (titleTokens.has(token)) score += 16;
-  }
-  for (const token of queryTokens) {
-    if (titleTokens.has(token)) score += 8;
-  }
-
-  if (anchor) {
-    if (anchor.countryCode) {
-      if (normalizeComparableText(bits.countryCode) === normalizeComparableText(anchor.countryCode)) score += 120;
-      else score -= 260;
-    }
-
-    const stateMatch =
-      (anchor.stateCode && bits.stateCode && normalizeComparableText(bits.stateCode) === normalizeComparableText(anchor.stateCode)) ||
-      (anchor.state && bits.state && normalizeComparableText(bits.state) === normalizeComparableText(anchor.state));
-
-    if (stateMatch) score += 80;
-
-    if (anchor.city) {
-      const cityMatch = bits.city && normalizeComparableText(bits.city) === normalizeComparableText(anchor.city);
-      if (cityMatch) score += 170;
-      else score -= 25;
-    }
-
-    const distanceMi = haversineMiles(anchor.lat, anchor.lng, item?.position?.lat, item?.position?.lng);
-    if (typeof distanceMi === "number") {
-      if (distanceMi <= 2) score += 120;
-      else if (distanceMi <= 5) score += 100;
-      else if (distanceMi <= 15) score += 70;
-      else if (distanceMi <= 30) score += 40;
-      else if (distanceMi <= 100) score += 10;
-      else if (distanceMi > 3000) score -= 300;
-      else if (distanceMi > 1000) score -= 200;
-      else if (distanceMi > 250) score -= 80;
-    }
-  }
-
-  return score;
-}
-
-async function geocodeSingleWithHere(rawQuery, options = {}) {
-  const query = normalizePlaceQuery(rawQuery);
-  const anchor = options?.anchor || null;
-  const maxAnchorDistanceMi =
-    typeof options?.maxAnchorDistanceMi === "number" && Number.isFinite(options.maxAnchorDistanceMi)
-      ? Math.max(1, options.maxAnchorDistanceMi)
-      : null;
-  if (!query) {
-    return {
-      query: safeString(rawQuery),
-      shortName: safeString(rawQuery),
-      displayName: safeString(rawQuery),
-      lat: null,
-      lng: null,
-      city: "",
-      stateCode: "",
-      state: "",
-      countryCode: "",
-      countryName: "",
-      resolved: false
-    };
-  }
-
-  const cacheKey = JSON.stringify({
-    q: query.toLowerCase(),
-    city: normalizeComparableText(anchor?.city || ""),
-    state: normalizeComparableText(anchor?.stateCode || anchor?.state || ""),
-    country: normalizeComparableText(anchor?.countryCode || ""),
-    maxAnchorDistanceMi: maxAnchorDistanceMi || 0
-  });
-  if (routeGeocodeCache.has(cacheKey)) return routeGeocodeCache.get(cacheKey);
-
-  const variants = buildQueryVariants(query, anchor);
-  let bestItem = null;
-  let bestScore = -Infinity;
-
-  for (const variant of variants) {
-    const items = await fetchHereGeocodeCandidates(variant, anchor ? 5 : 3);
-    for (const item of items) {
-      if (typeof item?.position?.lat !== "number" || typeof item?.position?.lng !== "number") continue;
-      const score = scoreHereCandidate(item, query, variant, anchor);
-      if (score > bestScore) {
-        bestScore = score;
-        bestItem = item;
-      }
-    }
-  }
-
-  if (!bestItem) {
-    const unresolved = {
-      query,
-      shortName: query,
-      displayName: query,
-      lat: null,
-      lng: null,
-      city: "",
-      stateCode: "",
-      state: "",
-      countryCode: "",
-      countryName: "",
-      resolved: false
-    };
-    routeGeocodeCache.set(cacheKey, unresolved);
-    return unresolved;
-  }
-
-  const names = buildHereDisplayNames(bestItem);
-  const bits = getHereAddressBits(bestItem);
-  const distanceFromAnchorMi = anchor
-    ? haversineMiles(anchor.lat, anchor.lng, bestItem.position.lat, bestItem.position.lng)
-    : null;
-
-  const mismatchedCountry =
-    anchor?.countryCode &&
-    bits.countryCode &&
-    normalizeComparableText(anchor.countryCode) !== normalizeComparableText(bits.countryCode);
-
-  const obviouslyFar =
-    anchor &&
-    typeof distanceFromAnchorMi === "number" &&
-    distanceFromAnchorMi > 500 &&
-    !(bits.city && anchor.city && normalizeComparableText(bits.city) === normalizeComparableText(anchor.city));
-
-  const outsideProbeRadius =
-    anchor &&
-    maxAnchorDistanceMi !== null &&
-    typeof distanceFromAnchorMi === "number" &&
-    distanceFromAnchorMi > maxAnchorDistanceMi;
-
-  if (outsideProbeRadius || (mismatchedCountry && obviouslyFar) || bestScore < 25) {
-    const unresolved = {
-      query,
-      shortName: query,
-      displayName: query,
-      lat: null,
-      lng: null,
-      city: "",
-      stateCode: "",
-      state: "",
-      countryCode: "",
-      countryName: "",
-      resolved: false
-    };
-    routeGeocodeCache.set(cacheKey, unresolved);
-    return unresolved;
-  }
-
-  const canonicalName = canonicalRouteDisplayName(rawQuery, anchor);
-  const finalShortName = canonicalName || names.shortName;
-  const finalDisplayName = canonicalName
-    ? ((bits.city || bits.stateCode || bits.countryCode)
-        ? `${finalShortName} — ${[bits.city, bits.stateCode || bits.countryCode].filter(Boolean).join(", ")}`
-        : finalShortName)
-    : names.displayName;
-
-  const resolved = {
-    query,
-    shortName: finalShortName,
-    displayName: finalDisplayName,
-    lat: bestItem.position.lat,
-    lng: bestItem.position.lng,
-    city: bits.city,
-    stateCode: bits.stateCode,
-    state: bits.state,
-    countryCode: bits.countryCode,
-    countryName: bits.countryName,
-    resolved: true
-  };
-  routeGeocodeCache.set(cacheKey, resolved);
-  return resolved;
-}
-
-
-function routeAnchorFromPoint(point) {
-  return point?.resolved ? inferAnchorContext(point, point) : null;
-}
-
-function routeAnchorKey(anchor) {
-  if (!anchor) return "";
-  return [
-    normalizeComparableText(anchor.city || ""),
-    normalizeComparableText(anchor.stateCode || anchor.state || ""),
-    normalizeComparableText(anchor.countryCode || anchor.countryName || ""),
-    typeof anchor.lat === "number" ? anchor.lat.toFixed(2) : "",
-    typeof anchor.lng === "number" ? anchor.lng.toFixed(2) : ""
-  ].join("|");
-}
-
-function routeQueryTokenCount(query) {
-  return tokenizeComparableText(query).filter((token) => token.length >= 3).length;
-}
-
-function routeSeedQueries(startText, endText, stops) {
-  const raw = [
-    safeString(startText).trim(),
-    safeString(endText).trim(),
-    ...stops
-  ].filter(Boolean);
-
-  const distinct = [];
-  for (const query of raw) {
-    const normalized = normalizeComparableText(query);
-    if (!normalized) continue;
-    if (!distinct.some((existing) => normalizeComparableText(existing) === normalized)) {
-      distinct.push(query);
-    }
-  }
-
-  // Long/distinctive place names are usually safer regional seeds than short generic labels.
-  return distinct
-    .map((query, index) => ({ query, index, tokens: routeQueryTokenCount(query) }))
-    .sort((a, b) => (b.tokens - a.tokens) || (a.index - b.index))
-    .slice(0, 6)
-    .map((item) => item.query);
-}
-
-function routeProbeQueries(startText, endText, stops) {
-  const seeds = routeSeedQueries(startText, endText, stops);
-  const endpoints = [safeString(startText).trim(), safeString(endText).trim()].filter(Boolean);
-  const combined = [...endpoints, ...seeds];
-
-  const distinct = [];
-  for (const query of combined) {
-    const normalized = normalizeComparableText(query);
-    if (!normalized) continue;
-    if (!distinct.some((existing) => normalizeComparableText(existing) === normalized)) {
-      distinct.push(query);
-    }
-  }
-  return distinct.slice(0, 5);
-}
-
-function routeAnchorLexicalSupport(anchor, allRouteText) {
-  if (!anchor) return 0;
-  const routeTokens = tokenizeComparableText(allRouteText).filter((token) => token.length >= 4);
-  if (!routeTokens.length) return 0;
-
-  const anchorTokens = new Set(
-    tokenizeComparableText(
-      [
-        anchor.city || "",
-        anchor.stateCode || "",
-        anchor.state || "",
-        anchor.countryCode || "",
-        anchor.countryName || ""
-      ].join(" ")
-    ).filter((token) => token.length >= 3)
-  );
-
-  let support = 0;
-  for (const token of routeTokens) {
-    if (anchorTokens.has(token)) support += 1;
-  }
-  return Math.min(8, support);
-}
-
-async function inferRouteRegionAnchor(startText, endText, stops) {
-  const seedQueries = routeSeedQueries(startText, endText, stops);
-  if (!seedQueries.length) return null;
-
-  const seedResults = [];
-  for (const query of seedQueries) {
-    const point = await geocodeSingleWithHere(query);
-    const anchor = routeAnchorFromPoint(point);
-    if (anchor) seedResults.push({ query, point, anchor });
-  }
-  if (!seedResults.length) return null;
-
-  const dedupedSeeds = [];
-  const seen = new Set();
-  for (const seed of seedResults) {
-    const key = routeAnchorKey(seed.anchor);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    dedupedSeeds.push(seed);
-  }
-
-  const allRouteText = [startText, endText, ...stops].join(" ");
-  const probeQueries = routeProbeQueries(startText, endText, stops);
-  let best = null;
-
-  // Keep this bounded: at most four candidate regions and five probe queries.
-  for (const seed of dedupedSeeds.slice(0, 4)) {
-    let score = routeAnchorLexicalSupport(seed.anchor, allRouteText);
-    let resolvedProbeCount = 0;
-    let nonSelfResolvedCount = 0;
-
-    for (const probeQuery of probeQueries) {
-      const probe = await geocodeSingleWithHere(probeQuery, {
-        anchor: seed.anchor,
-        maxAnchorDistanceMi: 175
-      });
-
-      if (!probe?.resolved) {
-        score -= 1;
-        continue;
-      }
-
-      resolvedProbeCount += 1;
-      const isSelf =
-        normalizeComparableText(probeQuery) === normalizeComparableText(seed.query);
-
-      if (isSelf) {
-        score += 1;
-      } else {
-        nonSelfResolvedCount += 1;
-        score += 4;
-      }
-
-      const distanceMi = haversineMiles(
-        seed.anchor.lat,
-        seed.anchor.lng,
-        probe.lat,
-        probe.lng
-      );
-      if (typeof distanceMi === "number") {
-        if (distanceMi <= 25) score += 2;
-        else if (distanceMi <= 75) score += 1;
-      }
-    }
-
-    const candidate = {
-      anchor: seed.anchor,
-      score,
-      resolvedProbeCount,
-      nonSelfResolvedCount
-    };
-
-    if (
-      !best ||
-      candidate.score > best.score ||
-      (candidate.score === best.score && candidate.nonSelfResolvedCount > best.nonSelfResolvedCount) ||
-      (
-        candidate.score === best.score &&
-        candidate.nonSelfResolvedCount === best.nonSelfResolvedCount &&
-        candidate.resolvedProbeCount > best.resolvedProbeCount
-      )
-    ) {
-      best = candidate;
-    }
-  }
-
-  // Require support from at least one OTHER route input. A seed that only resolves itself
-  // is not enough evidence to force the entire route into that city/state.
-  if (!best || best.nonSelfResolvedCount < 1 || best.score < 4) return null;
-  return best.anchor;
 }
 
 // Very simple credibility heuristic (Phase 3b-ready; replace later)
@@ -1362,7 +910,7 @@ app.post(
     const contextText = normalizePlaceQuery(req.body.contextText);
 
     if (!GOOGLE_PLACES_API_KEY) {
-      return res.status(500).json({ error: "Google Places is not configured." });
+      return res.status(503).json({ error: "Place suggestions are temporarily unavailable." });
     }
 
     const rawSuggestions = await fetchGooglePlacePredictions(query, contextText);
@@ -1379,8 +927,8 @@ app.post(
       items
     });
   } catch (err) {
-    console.error("❌ /place_autosuggest failed:", err);
-    return res.status(500).json({ error: "Place suggestions are unavailable right now." });
+    logBackendError(req, "place_autosuggest_failed", err);
+    return res.status(502).json({ error: "Place suggestions are temporarily unavailable." });
   }
 });
 
@@ -1461,7 +1009,7 @@ app.post(
     const contextText = normalizePlaceQuery(req.body.contextText);
 
     if (!GOOGLE_PLACES_API_KEY) {
-      return res.status(500).json({ error: "Google Maps Platform is not configured." });
+      return res.status(503).json({ error: "Route calculation is temporarily unavailable." });
     }
 
     const startText = routeInputText(start);
@@ -1495,8 +1043,8 @@ app.post(
       segmentCount: computed.segmentCount
     });
   } catch (err) {
-    console.error("❌ /route_compute failed:", err);
-    return res.status(502).json({ error: "Google route calculation is unavailable right now." });
+    logBackendError(req, "route_compute_failed", err);
+    return res.status(502).json({ error: "Route calculation is temporarily unavailable." });
   }
 });
 
@@ -1521,8 +1069,6 @@ app.post(
 
     const prompt = req.body.prompt;
 
-    console.log("📩 Incoming prompt:", prompt.substring(0, 200) + "...");
-
     const completion = await client.chat.completions.create({
       model: "gpt-4.1-mini",
       messages: [
@@ -1532,12 +1078,10 @@ app.post(
     });
 
     const output = completion.choices?.[0]?.message?.content || "";
-    console.log("📤 Output length:", output.length);
-
     return res.json({ result: output });
   } catch (err) {
-    console.error("❌ /generate failed:", err);
-    return res.status(500).json({ error: "AI generation failed", details: err.message });
+    logBackendError(req, "generate_failed", err);
+    return res.status(500).json({ error: "Generation is temporarily unavailable." });
   }
 });
 
@@ -1564,8 +1108,6 @@ app.post(
 
     const prompt = req.body.prompt;
 
-    console.log("🕵️ /agent_smith prompt head:", prompt.substring(0, 200) + "...");
-
     const completion = await client.chat.completions.create({
       model: "gpt-4.1-mini",
       temperature: 0.2,
@@ -1576,8 +1118,6 @@ app.post(
     });
 
     const raw = completion.choices?.[0]?.message?.content || "";
-    console.log("🧾 /agent_smith raw length:", raw.length);
-
     let parsed;
     try {
       parsed = JSON.parse(raw);
@@ -1639,11 +1179,10 @@ app.post(
 
     return res.json(parsed);
   } catch (err) {
-    console.error("❌ /agent_smith failed:", err);
+    logBackendError(req, "agent_smith_failed", err);
     return res.status(500).json({
       error: true,
-      message: "Agent Smith generation failed",
-      details: err.message
+      message: "Agent Smith is temporarily unavailable."
     });
   }
 });
@@ -1680,13 +1219,15 @@ app.post(
     }
 
     const q = req.body.query.trim();
-    console.log("🔎 /evidence_search query:", q);
-    console.log("   SerpApi key present?", !!SERPAPI_API_KEY);
-
     if (!SERPAPI_API_KEY) {
-      return res.status(500).json({
+      logBackendError(
+        req,
+        "evidence_search_config_missing",
+        { name: "ConfigurationError", code: "SERVICE_NOT_CONFIGURED" }
+      );
+      return res.status(503).json({
         error: true,
-        message: "Missing SERPAPI_API_KEY in environment (.env / Render).",
+        message: "Evidence search is temporarily unavailable.",
         results: []
       });
     }
@@ -1700,12 +1241,17 @@ app.post(
     const resp = await fetch(url, { method: "GET" });
 
     if (!resp.ok) {
-      const bodyText = await resp.text().catch(() => "");
-      console.error("❌ SerpApi fetch failed:", resp.status, resp.statusText, bodyText);
-      return res.status(500).json({
+      logBackendError(
+        req,
+        "evidence_search_upstream_failed",
+        {
+          name: "UpstreamError",
+          status: resp.status
+        }
+      );
+      return res.status(502).json({
         error: true,
-        message: "Evidence search failed (SerpApi error).",
-        details: `${resp.status} ${resp.statusText}`,
+        message: "Evidence search is temporarily unavailable.",
         results: []
       });
     }
@@ -1748,25 +1294,36 @@ app.post(
       });
     }
 
-    console.log("✅ /evidence_search (SerpApi DDG) results:", results.length);
     return res.json({ results });
   } catch (err) {
-    console.error("❌ /evidence_search failed:", err);
+    logBackendError(req, "evidence_search_failed", err);
     return res.status(500).json({
       error: true,
-      message: "Evidence search failed",
-      details: err.message
+      message: "Evidence search is temporarily unavailable.",
+      results: []
     });
   }
 });
 
 // --------------------------------------------------
-// TEMP TEST ROUTE (SAFE TO KEEP)
+// PHASE 4 — FINAL PUBLIC ERROR BOUNDARY
 // --------------------------------------------------
-app.post("/test", (req, res) => {
-  res.json({
-    received: req.body || {},
-    message: "Test route working!"
+app.use((req, res) => {
+  return res.status(404).json({
+    error: true,
+    message: "Endpoint not found."
+  });
+});
+
+app.use((err, req, res, next) => {
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  logBackendError(req, "unhandled_backend_error", err);
+  return res.status(500).json({
+    error: true,
+    message: "Service temporarily unavailable."
   });
 });
 
