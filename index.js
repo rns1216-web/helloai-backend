@@ -1,3 +1,6 @@
+// LinkLyfe narrow hotfix v7
+// Fixes GOOGLE_PLACES_API_KEY declaration accidentally commented out in v6.
+// No route behavior, Firebase auth, Places logic, or Routes logic changed.
 // LinkLyfe drop-in replacement
 // Route Planner Google Places + Google Routes v6.
 // Selected Place IDs route directly through Google Routes; HERE is no longer used by Route Planner.
@@ -11,7 +14,7 @@
 // LinkLyfe drop-in replacement
 // Route Planner routing repair v3: normal-mode region inference + user-order preservation support.
 // Phase 2 Firebase ID-token authentication remains unchanged.
-// index.js — HelloAI Backend (Full Working Version + Agent Smith + Evidence Search via SerpApi DuckDuckGo)
+// index.js â€” HelloAI Backend (Full Working Version + Agent Smith + Evidence Search via SerpApi DuckDuckGo)
 
 const express = require("express");
 const cors = require("cors");
@@ -56,7 +59,7 @@ try {
   initializeLinklyfeFirebaseAdmin();
 } catch (_) {
   console.error(
-    "❌ Firebase Admin initialization failed. Configure FIREBASE_SERVICE_ACCOUNT_JSON " +
+    "âŒ Firebase Admin initialization failed. Configure FIREBASE_SERVICE_ACCOUNT_JSON " +
     "or GOOGLE_APPLICATION_CREDENTIALS before starting the backend."
   );
   process.exit(1);
@@ -64,14 +67,15 @@ try {
 
 // Ensure OpenAI key exists
 if (!process.env.OPENAI_API_KEY) {
-  console.error("❌ Missing OPENAI_API_KEY in .env");
+  console.error("âŒ Missing OPENAI_API_KEY in .env");
   process.exit(1);
 }
 
 // SerpApi (DuckDuckGo) key for Evidence Search
 const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY;
 const HERE_API_KEY = process.env.HERE_API_KEY || "";
-// Shared restricted Google Maps Platform key: Places API (New) + Routes API only.\nconst GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || "";
+// Shared restricted Google Maps Platform key: Places API (New) + Routes API only.
+const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || "";
 const routeGeocodeCache = new Map();
 
 const client = new OpenAI({
@@ -156,7 +160,7 @@ function normalizePlaceQuery(text) {
 function normalizeComparableText(text) {
   return normalizePlaceQuery(text)
     .toLowerCase()
-    .replace(/[’']/g, "")
+    .replace(/[â€™']/g, "")
     .replace(/[^a-z0-9\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -178,7 +182,7 @@ function buildHereDisplayNames(item) {
   const suffix = [city, state || country].filter(Boolean).join(", ");
   return {
     shortName: title,
-    displayName: suffix ? `${title} — ${suffix}` : title
+    displayName: suffix ? `${title} â€” ${suffix}` : title
   };
 }
 
@@ -528,7 +532,7 @@ async function geocodeSingleWithHere(rawQuery, options = {}) {
   const finalShortName = canonicalName || names.shortName;
   const finalDisplayName = canonicalName
     ? ((bits.city || bits.stateCode || bits.countryCode)
-        ? `${finalShortName} — ${[bits.city, bits.stateCode || bits.countryCode].filter(Boolean).join(", ")}`
+        ? `${finalShortName} â€” ${[bits.city, bits.stateCode || bits.countryCode].filter(Boolean).join(", ")}`
         : finalShortName)
     : names.displayName;
 
@@ -1016,7 +1020,7 @@ async function computeGoogleOrderedRoute(allPoints, contextText = "") {
 // HEALTH CHECK
 // --------------------------------------------------
 app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "HelloAI backend is running 🚀" });
+  res.json({ status: "ok", message: "HelloAI backend is running ðŸš€" });
 });
 
 // --------------------------------------------------
@@ -1056,13 +1060,13 @@ app.post("/place_autosuggest", requireFirebaseIdToken, async (req, res) => {
       items
     });
   } catch (err) {
-    console.error("❌ /place_autosuggest failed:", err);
+    console.error("âŒ /place_autosuggest failed:", err);
     return res.status(500).json({ error: "Place suggestions are unavailable right now." });
   }
 });
 
 // --------------------------------------------------
-// GOOGLE ROUTES — DISTANCE ROUTE PLANNER
+// GOOGLE ROUTES â€” DISTANCE ROUTE PLANNER
 // Selected Google Places predictions use Place IDs.
 // Free-typed entries fall back to address strings.
 // Stop order is preserved; Pro waypoint optimization is not enabled.
@@ -1124,7 +1128,7 @@ app.post("/route_compute", requireFirebaseIdToken, async (req, res) => {
       segmentCount: computed.segmentCount
     });
   } catch (err) {
-    console.error("❌ /route_compute failed:", err);
+    console.error("âŒ /route_compute failed:", err);
     return res.status(502).json({ error: "Google route calculation is unavailable right now." });
   }
 });
@@ -1140,7 +1144,7 @@ app.post("/generate", requireFirebaseIdToken, async (req, res) => {
       return res.status(400).json({ error: "Missing 'prompt' in request body." });
     }
 
-    console.log("📩 Incoming prompt:", prompt.substring(0, 200) + "...");
+    console.log("ðŸ“© Incoming prompt:", prompt.substring(0, 200) + "...");
 
     const completion = await client.chat.completions.create({
       model: "gpt-4.1-mini",
@@ -1151,11 +1155,11 @@ app.post("/generate", requireFirebaseIdToken, async (req, res) => {
     });
 
     const output = completion.choices?.[0]?.message?.content || "";
-    console.log("📤 Output length:", output.length);
+    console.log("ðŸ“¤ Output length:", output.length);
 
     return res.json({ result: output });
   } catch (err) {
-    console.error("❌ /generate failed:", err);
+    console.error("âŒ /generate failed:", err);
     return res.status(500).json({ error: "AI generation failed", details: err.message });
   }
 });
@@ -1176,7 +1180,7 @@ app.post("/agent_smith", requireFirebaseIdToken, async (req, res) => {
       });
     }
 
-    console.log("🕵️ /agent_smith prompt head:", prompt.substring(0, 200) + "...");
+    console.log("ðŸ•µï¸ /agent_smith prompt head:", prompt.substring(0, 200) + "...");
 
     const completion = await client.chat.completions.create({
       model: "gpt-4.1-mini",
@@ -1188,7 +1192,7 @@ app.post("/agent_smith", requireFirebaseIdToken, async (req, res) => {
     });
 
     const raw = completion.choices?.[0]?.message?.content || "";
-    console.log("🧾 /agent_smith raw length:", raw.length);
+    console.log("ðŸ§¾ /agent_smith raw length:", raw.length);
 
     let parsed;
     try {
@@ -1251,7 +1255,7 @@ app.post("/agent_smith", requireFirebaseIdToken, async (req, res) => {
 
     return res.json(parsed);
   } catch (err) {
-    console.error("❌ /agent_smith failed:", err);
+    console.error("âŒ /agent_smith failed:", err);
     return res.status(500).json({
       error: true,
       message: "Agent Smith generation failed",
@@ -1277,7 +1281,7 @@ app.post("/evidence_search", requireFirebaseIdToken, async (req, res) => {
     }
 
     const q = query.trim();
-    console.log("🔎 /evidence_search query:", q);
+    console.log("ðŸ”Ž /evidence_search query:", q);
     console.log("   SerpApi key present?", !!SERPAPI_API_KEY);
 
     if (!SERPAPI_API_KEY) {
@@ -1298,7 +1302,7 @@ app.post("/evidence_search", requireFirebaseIdToken, async (req, res) => {
 
     if (!resp.ok) {
       const bodyText = await resp.text().catch(() => "");
-      console.error("❌ SerpApi fetch failed:", resp.status, resp.statusText, bodyText);
+      console.error("âŒ SerpApi fetch failed:", resp.status, resp.statusText, bodyText);
       return res.status(500).json({
         error: true,
         message: "Evidence search failed (SerpApi error).",
@@ -1318,7 +1322,7 @@ app.post("/evidence_search", requireFirebaseIdToken, async (req, res) => {
       const domain = extractDomain(link);
       const source = domain || null;
 
-      // ✅ Step 1: Pass through favicon when SerpApi provides it
+      // âœ… Step 1: Pass through favicon when SerpApi provides it
       const favicon = safeString(item.favicon || item.favicon_url || item.faviconUrl);
 
       return {
@@ -1345,10 +1349,10 @@ app.post("/evidence_search", requireFirebaseIdToken, async (req, res) => {
       });
     }
 
-    console.log("✅ /evidence_search (SerpApi DDG) results:", results.length);
+    console.log("âœ… /evidence_search (SerpApi DDG) results:", results.length);
     return res.json({ results });
   } catch (err) {
-    console.error("❌ /evidence_search failed:", err);
+    console.error("âŒ /evidence_search failed:", err);
     return res.status(500).json({
       error: true,
       message: "Evidence search failed",
@@ -1371,5 +1375,5 @@ app.post("/test", (req, res) => {
 // START SERVER
 // --------------------------------------------------
 app.listen(PORT, () => {
-  console.log(`✅ HelloAI server listening on port ${PORT}`);
+  console.log(`âœ… HelloAI server listening on port ${PORT}`);
 });
