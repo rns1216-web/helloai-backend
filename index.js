@@ -1194,7 +1194,7 @@ app.post(
     const prompt = req.body.prompt;
 
     const completion = await client.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: "gpt-5.6-luna",
       messages: [
         { role: "system", content: "You are Hello AI's smart assistant engine." },
         { role: "user", content: prompt }
@@ -1234,7 +1234,7 @@ app.post(
     const prompt = req.body.prompt;
 
     const completion = await client.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: "gpt-5.6-luna",
       temperature: 0.2,
       messages: [
         { role: "system", content: "Return ONLY valid JSON. No markdown. No extra text." },
