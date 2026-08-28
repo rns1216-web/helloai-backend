@@ -1,4 +1,6 @@
 // LinkLyfe Phase 6 monitoring + alert-signal backend v11
+// Narrow Recipe Remix hero-image seam v12
+// Adds an authenticated food-only image endpoint for Recipe Remix pop-outs without changing existing generate/auth behavior.
 // Adds safe structured monitoring events for security rejections, rate limits,
 // validation failures, slow requests, and server errors without logging user content.
 // Phase 5 App Check / Play Integrity enforcement behavior remains unchanged.
@@ -539,6 +541,11 @@ const phase3GenerateLimits = phase3UserEndpointLimits(
   6,
   24
 );
+const phase3RecipeRemixImageLimits = phase3UserEndpointLimits(
+  "recipe-remix-image",
+  8,
+  24
+);
 const phase3AgentSmithLimits = phase3UserEndpointLimits(
   "agent-smith",
   4,
@@ -621,6 +628,77 @@ function validateSimplePromptBody(body, maxLength) {
     minLength: 1,
     maxLength
   });
+}
+
+
+function validateOptionalStringArray(value, fieldName, maxItems, maxItemLength) {
+  if (value === undefined || value === null) return "";
+  if (!Array.isArray(value)) return `${fieldName} must be a list.`;
+  if (value.length > maxItems) return `${fieldName} has too many items.`;
+
+  for (const item of value) {
+    if (typeof item !== "string") return `${fieldName} items must be strings.`;
+    if (item.length > maxItemLength) return `${fieldName} items are too long.`;
+  }
+
+  return "";
+}
+
+function validateRecipeRemixImageBody(body) {
+  const shapeError = validateAllowedKeys(body, [
+    "baseDish",
+    "remixTitle",
+    "coreShift",
+    "buildNotes",
+    "supplementItems",
+    "flavorCues",
+    "optionalExtras",
+    "whyItWorks"
+  ]);
+  if (shapeError) return shapeError;
+
+  const remixTitleError = validateStringValue(body.remixTitle, {
+    fieldName: "remixTitle",
+    required: true,
+    minLength: 1,
+    maxLength: 180
+  });
+  if (remixTitleError) return remixTitleError;
+
+  const baseDishError = validateStringValue(body.baseDish, {
+    fieldName: "baseDish",
+    required: false,
+    maxLength: 180
+  });
+  if (baseDishError) return baseDishError;
+
+  const coreShiftError = validateStringValue(body.coreShift, {
+    fieldName: "coreShift",
+    required: false,
+    maxLength: 600
+  });
+  if (coreShiftError) return coreShiftError;
+
+  const whyItWorksError = validateStringValue(body.whyItWorks, {
+    fieldName: "whyItWorks",
+    required: false,
+    maxLength: 600
+  });
+  if (whyItWorksError) return whyItWorksError;
+
+  const buildNotesError = validateOptionalStringArray(body.buildNotes, "buildNotes", 10, 500);
+  if (buildNotesError) return buildNotesError;
+
+  const supplementItemsError = validateOptionalStringArray(body.supplementItems, "supplementItems", 10, 120);
+  if (supplementItemsError) return supplementItemsError;
+
+  const flavorCuesError = validateOptionalStringArray(body.flavorCues, "flavorCues", 10, 80);
+  if (flavorCuesError) return flavorCuesError;
+
+  const optionalExtrasError = validateOptionalStringArray(body.optionalExtras, "optionalExtras", 10, 120);
+  if (optionalExtrasError) return optionalExtrasError;
+
+  return "";
 }
 
 function validateRouteLocationObject(value, fieldName) {
@@ -1170,6 +1248,71 @@ app.post(
     return res.status(502).json({ error: "Route calculation is temporarily unavailable." });
   }
 });
+
+// --------------------------------------------------
+// RECIPE REMIX HERO IMAGE ENDPOINT
+// Expects: { remixTitle, coreShift?, buildNotes?, supplementItems?, flavorCues?, optionalExtras?, whyItWorks?, baseDish? }
+// Returns: { imageBase64, mimeType }
+// --------------------------------------------------
+app.post(
+  "/recipe_remix_image",
+  phase3NetworkGate,
+  requireFirebaseIdToken,
+  verifyLinklyfeAppCheck,
+  phase3UserGate,
+  ...phase3RecipeRemixImageLimits,
+  async (req, res) => {
+    try {
+      const validationError = validateRecipeRemixImageBody(req.body || {});
+      if (validationError) {
+        return respondPhase3ValidationError(res, validationError);
+      }
+
+      const remixTitle = String(req.body.remixTitle || "").trim();
+      const baseDish = String(req.body.baseDish || "").trim();
+      const coreShift = String(req.body.coreShift || "").trim();
+      const whyItWorks = String(req.body.whyItWorks || "").trim();
+      const buildNotes = Array.isArray(req.body.buildNotes) ? req.body.buildNotes.map((x) => String(x).trim()).filter(Boolean).slice(0, 8) : [];
+      const supplementItems = Array.isArray(req.body.supplementItems) ? req.body.supplementItems.map((x) => String(x).trim()).filter(Boolean).slice(0, 8) : [];
+      const flavorCues = Array.isArray(req.body.flavorCues) ? req.body.flavorCues.map((x) => String(x).trim()).filter(Boolean).slice(0, 8) : [];
+      const optionalExtras = Array.isArray(req.body.optionalExtras) ? req.body.optionalExtras.map((x) => String(x).trim()).filter(Boolean).slice(0, 8) : [];
+
+      const promptParts = [
+        "Create a realistic plated food photo of one finished remixed meal.",
+        `Dish title: ${remixTitle}.`,
+        baseDish ? `Original/base dish being remixed: ${baseDish}.` : "",
+        coreShift ? `Core shift: ${coreShift}.` : "",
+        buildNotes.length ? `Build notes to visually honor: ${buildNotes.join(" ")}` : "",
+        supplementItems.length ? `Supplement items actually added: ${supplementItems.join(", ")}.` : "",
+        flavorCues.length ? `Flavor cues: ${flavorCues.join(", ")}.` : "",
+        optionalExtras.length ? `Optional extras that may appear subtly: ${optionalExtras.join(", ")}.` : "",
+        whyItWorks ? `Why it works: ${whyItWorks}.` : "",
+        "Style: appetizing, clean, modern food photography; natural lighting; tight crop; the vessel should match the dish (for example a bowl for a bowl, plate for a plated meal).",
+        "Important: show only the food and its immediate serving vessel. No people, no hands, no street scenes, no restaurant interiors, no text, no labels, no UI, no collage. Avoid stock-photo lifestyle scenes.",
+        "The image should feel like a finished hero meal image suitable to sit above a recipe card in an app."
+      ].filter(Boolean).join("\n");
+
+      const imageResponse = await client.images.generate({
+        model: "gpt-image-1",
+        prompt: promptParts,
+        size: "1024x1024"
+      });
+
+      const imageBase64 = imageResponse?.data?.[0]?.b64_json || "";
+      if (!imageBase64) {
+        return res.status(502).json({ error: true, message: "Image generation returned no image." });
+      }
+
+      return res.json({
+        imageBase64,
+        mimeType: "image/png"
+      });
+    } catch (err) {
+      logBackendError(req, "recipe_remix_image_failed", err);
+      return res.status(500).json({ error: "Recipe Remix image generation is temporarily unavailable." });
+    }
+  }
+);
 
 // --------------------------------------------------
 // MINI-BRAIN GENERATE ENDPOINT (MAIN ENDPOINT)
