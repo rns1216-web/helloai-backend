@@ -1,6 +1,7 @@
-// LinkLyfe Recipe Remix Runware live-image delivery v16.
+// LinkLyfe Recipe Remix Runware minimal-schema delivery v17.
 // Uses the existing authenticated /recipe_remix_images endpoint with FLUX.2 [klein] 4B.
-// v16 returns base64 JPEG image data through LinkLyfe instead of temporary external image URLs.
+// v17 sends Runware's minimal documented text-to-image request, then immediately downloads
+// each returned imageURL server-side and returns base64 JPEG data to the existing Android seam.
 // Existing /generate behavior, Mini-Brain prompts, ModeContracts generation rules, and all other routes are unchanged.
 // LinkLyfe Phase 6 monitoring + alert-signal backend v11
 // Adds safe structured monitoring events for security rejections, rate limits,
@@ -1181,21 +1182,54 @@ async function fetchRunwareRecipeRemixBatch(tasks) {
       signal: controller.signal
     });
 
+    // Always read Runware's JSON body before deciding success/failure. Their error
+    // payload identifies the rejected parameter/code; keeping those two fields on
+    // the thrown error gives Render useful diagnostics without logging user prompts.
+    const payload = await response.json().catch(() => ({}));
+    const data = Array.isArray(payload?.data) ? payload.data : [];
+    const upstreamErrors = Array.isArray(payload?.errors) ? payload.errors : [];
+
     if (!response.ok) {
-      throw new Error(`Runware request failed with status ${response.status}`);
+      const firstError = upstreamErrors[0] || {};
+      const error = new Error(`Runware request failed with status ${response.status}`);
+      error.status = response.status;
+      error.runwareCode = safeString(firstError?.code).slice(0, 100) || undefined;
+      error.runwareParameter = safeString(firstError?.parameter).slice(0, 120) || undefined;
+      throw error;
     }
 
-    const payload = await response.json();
-    const data = Array.isArray(payload?.data) ? payload.data : [];
-
     if (data.length === 0) {
-      const upstreamErrors = Array.isArray(payload?.errors)
-        ? payload.errors.length
-        : (payload?.error ? 1 : 0);
-      throw new Error(`Runware returned no image data (errors=${upstreamErrors})`);
+      const firstError = upstreamErrors[0] || {};
+      const error = new Error(`Runware returned no image data (errors=${upstreamErrors.length})`);
+      error.runwareCode = safeString(firstError?.code).slice(0, 100) || undefined;
+      error.runwareParameter = safeString(firstError?.parameter).slice(0, 120) || undefined;
+      throw error;
     }
 
     return data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchRunwareImageAsBase64(imageURL) {
+  const cleanedURL = safeString(imageURL).trim();
+  if (!cleanedURL) return "";
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12_000);
+  timeout.unref?.();
+
+  try {
+    const response = await fetch(cleanedURL, { method: "GET", signal: controller.signal });
+    if (!response.ok) return "";
+
+    const contentType = safeString(response.headers.get("content-type")).toLowerCase();
+    if (contentType && !contentType.startsWith("image/")) return "";
+
+    const arrayBuffer = await response.arrayBuffer();
+    if (!arrayBuffer || arrayBuffer.byteLength === 0) return "";
+    return Buffer.from(arrayBuffer).toString("base64");
   } finally {
     clearTimeout(timeout);
   }
@@ -1219,20 +1253,17 @@ async function generateRecipeRemixImagesWithRunware({
     })
   }));
 
+  // Keep the Runware request intentionally minimal and aligned to the documented
+  // text-to-image REST example. Runware returns its default temporary imageURL;
+  // LinkLyfe immediately downloads that URL server-side and sends base64 to Android,
+  // so the app never depends on loading a Runware-hosted URL itself.
   const tasks = taskMeta.map((item) => ({
     taskType: "imageInference",
     taskUUID: item.taskUUID,
     model: RUNWARE_RECIPE_REMIX_MODEL,
     positivePrompt: item.prompt,
     width: 1024,
-    height: 1024,
-    steps: 4,
-    numberResults: 1,
-    outputType: "base64Data",
-    outputFormat: "JPG",
-    outputQuality: 88,
-    deliveryMethod: "sync",
-    includeCost: true
+    height: 1024
   }));
 
   const data = await fetchRunwareRecipeRemixBatch(tasks);
@@ -1242,15 +1273,17 @@ async function generateRecipeRemixImagesWithRunware({
       .map((item) => [safeString(item.taskUUID).trim(), item])
   );
 
-  return taskMeta.map((meta) => {
+  const resolved = await Promise.all(taskMeta.map(async (meta) => {
     const item = byTaskUUID.get(meta.taskUUID);
     if (!item) return null;
 
-    const imageBase64 = safeString(item?.imageBase64Data).trim();
+    const imageURL = safeString(item?.imageURL).trim();
+    if (!imageURL) return null;
+
+    const imageBase64 = await fetchRunwareImageAsBase64(imageURL).catch(() => "");
     if (!imageBase64) return null;
 
     const cost = Number(item?.cost);
-
     return {
       title: meta.title,
       imageBase64,
@@ -1258,7 +1291,9 @@ async function generateRecipeRemixImagesWithRunware({
       imageUUID: safeString(item?.imageUUID).trim() || undefined,
       costUsd: Number.isFinite(cost) && cost >= 0 ? cost : undefined
     };
-  }).filter(Boolean);
+  }));
+
+  return resolved.filter(Boolean);
 }
 
 // --------------------------------------------------
@@ -1557,7 +1592,9 @@ app.post(
       logBackendError(req, "recipe_remix_images_failed", err, {
         provider: "runware",
         model: RUNWARE_RECIPE_REMIX_MODEL,
-        timedOut: err?.name === "AbortError"
+        timedOut: err?.name === "AbortError",
+        runwareCode: safeString(err?.runwareCode).slice(0, 100) || undefined,
+        runwareParameter: safeString(err?.runwareParameter).slice(0, 120) || undefined
       });
       return res.status(502).json({
         error: true,
