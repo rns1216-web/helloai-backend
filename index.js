@@ -1,3 +1,6 @@
+// LinkLyfe Recipe Remix Runware live-image prototype v14
+// Adds a separate authenticated /recipe_remix_images endpoint using FLUX.2 [klein] 4B.
+// Existing /generate behavior, Mini-Brain prompts, ModeContracts, and all other routes are unchanged.
 // LinkLyfe Phase 6 monitoring + alert-signal backend v11
 // Adds safe structured monitoring events for security rejections, rate limits,
 // validation failures, slow requests, and server errors without logging user content.
@@ -93,6 +96,15 @@ if (!process.env.OPENAI_API_KEY) {
 const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY;
 // Shared restricted Google Maps Platform key: Places API (New) + Routes API only.
 const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || "";
+
+// Recipe Remix live images (server-side only; never expose this key to Android).
+// The endpoint is optional: if RUNWARE_API_KEY is absent, every existing LinkLyfe
+// route continues to start and work normally.
+const RUNWARE_API_KEY = String(process.env.RUNWARE_API_KEY || "").trim();
+const RUNWARE_API_URL = "https://api.runware.ai/v1";
+const RUNWARE_RECIPE_REMIX_MODEL =
+  String(process.env.RUNWARE_RECIPE_REMIX_MODEL || "runware:400@4").trim() ||
+  "runware:400@4";
 
 // Phase 5 App Check rollout:
 // - monitor (default): verify/log tokens but never block an otherwise authenticated request.
@@ -539,6 +551,15 @@ const phase3GenerateLimits = phase3UserEndpointLimits(
   6,
   24
 );
+
+// One request can create up to three Recipe Remix images in a single Runware batch.
+// Keep the same full-run cadence as /generate so image traffic cannot be used as
+// a cheap unauthenticated or unbounded media-generation proxy.
+const phase3RecipeRemixImageLimits = phase3UserEndpointLimits(
+  "recipe-remix-images",
+  6,
+  24
+);
 const phase3AgentSmithLimits = phase3UserEndpointLimits(
   "agent-smith",
   4,
@@ -621,6 +642,41 @@ function validateSimplePromptBody(body, maxLength) {
     minLength: 1,
     maxLength
   });
+}
+
+function validateRecipeRemixImagesBody(body) {
+  const shapeError = validateAllowedKeys(body, [
+    "baseDish",
+    "cuisine",
+    "remixType",
+    "result"
+  ]);
+  if (shapeError) return shapeError;
+
+  const resultError = validateStringValue(body.result, {
+    fieldName: "result",
+    required: true,
+    minLength: 20,
+    maxLength: 24000
+  });
+  if (resultError) return resultError;
+
+  const optionalFields = [
+    ["baseDish", 300],
+    ["cuisine", 100],
+    ["remixType", 120]
+  ];
+
+  for (const [fieldName, maxLength] of optionalFields) {
+    const error = validateStringValue(body[fieldName], {
+      fieldName,
+      required: false,
+      maxLength
+    });
+    if (error) return error;
+  }
+
+  return "";
 }
 
 function validateRouteLocationObject(value, fieldName) {
@@ -978,6 +1034,232 @@ async function computeGoogleOrderedRoute(allPoints, contextText = "") {
 }
 
 // --------------------------------------------------
+// RECIPE REMIX LIVE IMAGE HELPERS (RUNWARE)
+// --------------------------------------------------
+
+function cleanRecipeRemixImageText(raw, maxLength = 1800) {
+  return safeString(raw)
+    .replace(/\*\*/g, "")
+    .replace(/^\s*#{1,6}\s*/gm, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function recipeRemixNamedTitleMatch(line) {
+  const value = safeString(line).trim();
+  if (!value) return null;
+
+  // Normal contract form: 1. **Street Corn Chicken Bowl**
+  let match = value.match(
+    /^(?:#{1,4}\s*)?(\d{1,2})[.)]\s+\*\*([^*]{3,100})\*\*(?:\s*[:—–-]\s*(.*))?$/
+  );
+
+  // Defensive alternate: **1. Street Corn Chicken Bowl**
+  if (!match) {
+    match = value.match(
+      /^(?:#{1,4}\s*)?\*\*(\d{1,2})[.)]\s+([^*]{3,100})\*\*(?:\s*[:—–-]\s*(.*))?$/
+    );
+  }
+
+  if (!match) return null;
+
+  const title = safeString(match[2])
+    .replace(/\*\*/g, "")
+    .trim()
+    .replace(/:$/, "")
+    .trim();
+
+  if (title.length < 3 || title.length > 100) return null;
+
+  return {
+    number: Number(match[1]),
+    title,
+    inlineTail: safeString(match[3]).trim()
+  };
+}
+
+function isRecipeRemixFollowingTopLevelHeading(line) {
+  const cleaned = safeString(line)
+    .trim()
+    .replace(/^#{1,4}\s*/, "")
+    .replace(/\*\*/g, "")
+    .replace(/:$/, "")
+    .trim()
+    .toLowerCase();
+
+  return [
+    "easiest remix",
+    "mild version",
+    "ingredient swaps"
+  ].includes(cleaned);
+}
+
+function extractRecipeRemixImageSections(rawResult) {
+  const lines = safeString(rawResult)
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n");
+
+  const starts = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = recipeRemixNamedTitleMatch(lines[index]);
+    if (!match) continue;
+
+    starts.push({
+      index,
+      title: match.title,
+      inlineTail: match.inlineTail
+    });
+
+    if (starts.length >= 3) break;
+  }
+
+  if (starts.length === 0) return [];
+
+  return starts.map((start, position) => {
+    let endIndex =
+      position + 1 < starts.length
+        ? starts[position + 1].index
+        : lines.length;
+
+    // Do not absorb optional top-level sections into the third image description.
+    for (let index = start.index + 1; index < endIndex; index += 1) {
+      if (isRecipeRemixFollowingTopLevelHeading(lines[index])) {
+        endIndex = index;
+        break;
+      }
+    }
+
+    const bodyLines = [];
+    if (start.inlineTail) bodyLines.push(start.inlineTail);
+    bodyLines.push(...lines.slice(start.index + 1, endIndex));
+
+    return {
+      title: start.title,
+      details: cleanRecipeRemixImageText(bodyLines.join("\n"))
+    };
+  });
+}
+
+function buildRecipeRemixRunwarePrompt({
+  baseDish,
+  cuisine,
+  remixType,
+  title,
+  details
+}) {
+  return [
+    "Photorealistic food photography of one finished meal for a modern recipe app.",
+    `Dish: ${title}.`,
+    baseDish ? `Original dish being remixed: ${baseDish}.` : "",
+    cuisine ? `Cuisine / flavor direction: ${cuisine}.` : "",
+    remixType ? `Requested finished format: ${remixType}.` : "",
+    details ? `Recipe details to visually honor: ${details}` : "",
+    "Match the named dish and its described visible ingredients as closely as possible. Preserve the correct main protein or center and the requested dish format.",
+    "Show one complete finished serving only. Tight appetizing crop, realistic food textures, natural soft lighting, clean plating, believable portions.",
+    "No people, no hands, no packaging, no restaurant scene, no text, no labels, no logos, no UI, no collage.",
+    "Use the serving vessel that naturally fits the dish. The food should fill most of the frame and look like a real meal rather than an advertisement."
+  ].filter(Boolean).join("\n");
+}
+
+async function fetchRunwareRecipeRemixBatch(tasks) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 7_000);
+  timeout.unref?.();
+
+  try {
+    const response = await fetch(RUNWARE_API_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${RUNWARE_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(tasks),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`Runware request failed with status ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const data = Array.isArray(payload?.data) ? payload.data : [];
+
+    if (data.length === 0) {
+      const upstreamErrors = Array.isArray(payload?.errors)
+        ? payload.errors.length
+        : (payload?.error ? 1 : 0);
+      throw new Error(`Runware returned no image data (errors=${upstreamErrors})`);
+    }
+
+    return data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function generateRecipeRemixImagesWithRunware({
+  baseDish,
+  cuisine,
+  remixType,
+  sections
+}) {
+  const taskMeta = sections.slice(0, 3).map((section) => ({
+    taskUUID: randomUUID(),
+    title: section.title,
+    prompt: buildRecipeRemixRunwarePrompt({
+      baseDish,
+      cuisine,
+      remixType,
+      title: section.title,
+      details: section.details
+    })
+  }));
+
+  const tasks = taskMeta.map((item) => ({
+    taskType: "imageInference",
+    taskUUID: item.taskUUID,
+    model: RUNWARE_RECIPE_REMIX_MODEL,
+    positivePrompt: item.prompt,
+    width: 1024,
+    height: 1024,
+    steps: 4,
+    numberResults: 1,
+    outputType: "URL",
+    outputFormat: "JPG",
+    outputQuality: 88,
+    deliveryMethod: "sync",
+    includeCost: true
+  }));
+
+  const data = await fetchRunwareRecipeRemixBatch(tasks);
+  const byTaskUUID = new Map(
+    data
+      .filter((item) => safeString(item?.taskUUID).trim())
+      .map((item) => [safeString(item.taskUUID).trim(), item])
+  );
+
+  return taskMeta.map((meta) => {
+    const item = byTaskUUID.get(meta.taskUUID);
+    if (!item) return null;
+
+    const imageUrl = safeString(item?.imageURL).trim();
+    if (!imageUrl) return null;
+
+    const cost = Number(item?.cost);
+
+    return {
+      title: meta.title,
+      imageUrl,
+      imageUUID: safeString(item?.imageUUID).trim() || undefined,
+      costUsd: Number.isFinite(cost) && cost >= 0 ? cost : undefined
+    };
+  }).filter(Boolean);
+}
+
+// --------------------------------------------------
 // HEALTH CHECK
 // --------------------------------------------------
 app.get("/", (req, res) => {
@@ -1170,6 +1452,98 @@ app.post(
     return res.status(502).json({ error: "Route calculation is temporarily unavailable." });
   }
 });
+
+// --------------------------------------------------
+// RECIPE REMIX LIVE IMAGES — RUNWARE FLUX.2 [klein] 4B
+// Expects: { baseDish?, cuisine?, remixType?, result }
+// Returns up to three title-matched temporary image URLs.
+// This route never changes /generate output and never calls another LLM.
+// --------------------------------------------------
+app.post(
+  "/recipe_remix_images",
+  phase3NetworkGate,
+  requireFirebaseIdToken,
+  verifyLinklyfeAppCheck,
+  phase3UserGate,
+  ...phase3RecipeRemixImageLimits,
+  async (req, res) => {
+    try {
+      const validationError = validateRecipeRemixImagesBody(req.body || {});
+      if (validationError) {
+        return respondPhase3ValidationError(res, validationError);
+      }
+
+      if (!RUNWARE_API_KEY) {
+        logMonitoringEvent(req, "provider_config_missing", { provider: "runware" });
+        return res.status(503).json({
+          error: true,
+          message: "Recipe Remix images are temporarily unavailable."
+        });
+      }
+
+      const baseDish = safeString(req.body.baseDish).trim();
+      const cuisine = safeString(req.body.cuisine).trim();
+      const remixType = safeString(req.body.remixType).trim();
+      const result = safeString(req.body.result);
+
+      const sections = extractRecipeRemixImageSections(result).slice(0, 3);
+
+      // Image generation is an enhancement, never a reason to fail the text result.
+      // If the model's formatting drifts, return a successful empty image set.
+      if (sections.length === 0) {
+        logMonitoringEvent(req, "recipe_remix_images_skipped", {
+          reason: "named_sections_not_found"
+        });
+        return res.json({
+          provider: "runware",
+          model: RUNWARE_RECIPE_REMIX_MODEL,
+          images: [],
+          partial: true,
+          generationMs: 0,
+          totalCostUsd: 0
+        });
+      }
+
+      const startedAt = Date.now();
+      const images = await generateRecipeRemixImagesWithRunware({
+        baseDish,
+        cuisine,
+        remixType,
+        sections
+      });
+      const generationMs = Date.now() - startedAt;
+      const totalCostUsd = images.reduce(
+        (sum, image) => sum + (Number(image.costUsd) || 0),
+        0
+      );
+
+      if (images.length === 0) {
+        logMonitoringEvent(req, "recipe_remix_images_empty", {
+          requested: sections.length
+        });
+        return res.status(502).json({
+          error: true,
+          message: "Recipe Remix images are temporarily unavailable."
+        });
+      }
+
+      return res.json({
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        images,
+        partial: images.length !== sections.length,
+        generationMs,
+        totalCostUsd
+      });
+    } catch (err) {
+      logBackendError(req, "recipe_remix_images_failed", err);
+      return res.status(502).json({
+        error: true,
+        message: "Recipe Remix images are temporarily unavailable."
+      });
+    }
+  }
+);
 
 // --------------------------------------------------
 // MINI-BRAIN GENERATE ENDPOINT (MAIN ENDPOINT)
@@ -1461,6 +1835,8 @@ app.listen(PORT, () => {
   console.log(JSON.stringify({
     event: "server_start",
     monitoringPhase: "phase6",
-    appCheckEnforcementMode: APP_CHECK_ENFORCEMENT_MODE
+    appCheckEnforcementMode: APP_CHECK_ENFORCEMENT_MODE,
+    runwareRecipeRemixConfigured: Boolean(RUNWARE_API_KEY),
+    runwareRecipeRemixModel: RUNWARE_RECIPE_REMIX_MODEL
   }));
 });
