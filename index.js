@@ -1166,7 +1166,7 @@ function buildRecipeRemixRunwarePrompt({
 
 async function fetchRunwareRecipeRemixBatch(tasks) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 7_000);
+  const timeout = setTimeout(() => controller.abort(), 20_000);
   timeout.unref?.();
 
   try {
@@ -1505,6 +1505,13 @@ app.post(
       }
 
       const startedAt = Date.now();
+      logMonitoringEvent(req, "recipe_remix_images_started", {
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        requested: sections.length,
+        timeoutMs: 20000
+      });
+
       const images = await generateRecipeRemixImagesWithRunware({
         baseDish,
         cuisine,
@@ -1516,6 +1523,15 @@ app.post(
         (sum, image) => sum + (Number(image.costUsd) || 0),
         0
       );
+
+      logMonitoringEvent(req, "recipe_remix_images_completed", {
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        requested: sections.length,
+        received: images.length,
+        generationMs,
+        partial: images.length !== sections.length
+      });
 
       if (images.length === 0) {
         logMonitoringEvent(req, "recipe_remix_images_empty", {
@@ -1536,7 +1552,11 @@ app.post(
         totalCostUsd
       });
     } catch (err) {
-      logBackendError(req, "recipe_remix_images_failed", err);
+      logBackendError(req, "recipe_remix_images_failed", err, {
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        timedOut: err?.name === "AbortError"
+      });
       return res.status(502).json({
         error: true,
         message: "Recipe Remix images are temporarily unavailable."
