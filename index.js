@@ -1,6 +1,7 @@
-// LinkLyfe Recipe Remix Runware live-image prototype v14
-// Adds a separate authenticated /recipe_remix_images endpoint using FLUX.2 [klein] 4B.
-// Existing /generate behavior, Mini-Brain prompts, ModeContracts, and all other routes are unchanged.
+// LinkLyfe Recipe Remix Runware live-image delivery v16.
+// Uses the existing authenticated /recipe_remix_images endpoint with FLUX.2 [klein] 4B.
+// v16 returns base64 JPEG image data through LinkLyfe instead of temporary external image URLs.
+// Existing /generate behavior, Mini-Brain prompts, ModeContracts generation rules, and all other routes are unchanged.
 // LinkLyfe Phase 6 monitoring + alert-signal backend v11
 // Adds safe structured monitoring events for security rejections, rate limits,
 // validation failures, slow requests, and server errors without logging user content.
@@ -1227,7 +1228,7 @@ async function generateRecipeRemixImagesWithRunware({
     height: 1024,
     steps: 4,
     numberResults: 1,
-    outputType: "URL",
+    outputType: "base64Data",
     outputFormat: "JPG",
     outputQuality: 88,
     deliveryMethod: "sync",
@@ -1245,14 +1246,15 @@ async function generateRecipeRemixImagesWithRunware({
     const item = byTaskUUID.get(meta.taskUUID);
     if (!item) return null;
 
-    const imageUrl = safeString(item?.imageURL).trim();
-    if (!imageUrl) return null;
+    const imageBase64 = safeString(item?.imageBase64Data).trim();
+    if (!imageBase64) return null;
 
     const cost = Number(item?.cost);
 
     return {
       title: meta.title,
-      imageUrl,
+      imageBase64,
+      mimeType: "image/jpeg",
       imageUUID: safeString(item?.imageUUID).trim() || undefined,
       costUsd: Number.isFinite(cost) && cost >= 0 ? cost : undefined
     };
@@ -1456,7 +1458,7 @@ app.post(
 // --------------------------------------------------
 // RECIPE REMIX LIVE IMAGES — RUNWARE FLUX.2 [klein] 4B
 // Expects: { baseDish?, cuisine?, remixType?, result }
-// Returns up to three title-matched temporary image URLs.
+// Returns up to three title-matched base64 JPEG images.
 // This route never changes /generate output and never calls another LLM.
 // --------------------------------------------------
 app.post(
