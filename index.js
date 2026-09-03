@@ -1,3 +1,4 @@
+// LinkLyfe Patch 1-9: protected one-image Trip Runware endpoint.
 // LinkLyfe Recipe Remix Runware minimal-schema delivery v17.
 // Uses the existing authenticated /recipe_remix_images endpoint with FLUX.2 [klein] 4B.
 // v17 sends Runware's minimal documented text-to-image request, then immediately downloads
@@ -562,6 +563,14 @@ const phase3RecipeRemixImageLimits = phase3UserEndpointLimits(
   6,
   24
 );
+
+// Trip images create one Runware image per completed Trip result. Keep the same
+// protected cadence as the existing image endpoint without sharing its counter.
+const phase3TripImageLimits = phase3UserEndpointLimits(
+  "trip-image",
+  6,
+  24
+);
 const phase3AgentSmithLimits = phase3UserEndpointLimits(
   "agent-smith",
   4,
@@ -670,6 +679,55 @@ function validateRecipeRemixImagesBody(body) {
   ];
 
   for (const [fieldName, maxLength] of optionalFields) {
+    const error = validateStringValue(body[fieldName], {
+      fieldName,
+      required: false,
+      maxLength
+    });
+    if (error) return error;
+  }
+
+  return "";
+}
+
+function validateTripImageBody(body) {
+  const shapeError = validateAllowedKeys(body, [
+    "modeKey",
+    "destination",
+    "dates",
+    "tripGoal",
+    "result"
+  ]);
+  if (shapeError) return shapeError;
+
+  const modeError = validateStringValue(body.modeKey, {
+    fieldName: "modeKey",
+    required: true,
+    minLength: 1,
+    maxLength: 40
+  });
+  if (modeError) return modeError;
+  if (!["trip/highlights", "trip/threeDay"].includes(String(body.modeKey || "").trim())) {
+    return "modeKey is not supported for trip images.";
+  }
+
+  const destinationError = validateStringValue(body.destination, {
+    fieldName: "destination",
+    required: true,
+    minLength: 2,
+    maxLength: 240
+  });
+  if (destinationError) return destinationError;
+
+  const resultError = validateStringValue(body.result, {
+    fieldName: "result",
+    required: true,
+    minLength: 20,
+    maxLength: 32000
+  });
+  if (resultError) return resultError;
+
+  for (const [fieldName, maxLength] of [["dates", 120], ["tripGoal", 500]]) {
     const error = validateStringValue(body[fieldName], {
       fieldName,
       required: false,
@@ -1297,6 +1355,65 @@ async function generateRecipeRemixImagesWithRunware({
 }
 
 // --------------------------------------------------
+// TRIP LIVE IMAGE HELPERS (RUNWARE)
+// --------------------------------------------------
+
+function cleanTripImageContext(raw, maxLength = 2200) {
+  return safeString(raw)
+    .replace(/\*\*/g, "")
+    .replace(/^\s*#{1,6}\s*/gm, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function buildTripRunwarePrompt({ modeKey, destination, dates, tripGoal, result }) {
+  const modeDirection = modeKey === "trip/highlights"
+    ? "Create one representative destination image for a travel discovery guide."
+    : "Create one representative destination/trip image for a day-by-day itinerary overview.";
+
+  return [
+    "Photorealistic travel photography for a modern trip-planning app.",
+    modeDirection,
+    `Destination: ${destination}.`,
+    dates ? `Travel dates / season context: ${dates}.` : "",
+    tripGoal ? `Trip focus: ${tripGoal}.` : "",
+    result ? `Use this completed trip result only as visual context: ${cleanTripImageContext(result)}` : "",
+    "Show a believable, visually strong scene that feels recognizably connected to the destination or its defining atmosphere.",
+    "Prefer a broad scenic or landmark-oriented composition over a close-up object. Natural light, realistic colors, editorial travel-photo quality.",
+    "One coherent image only. No collage, no map, no itinerary graphics, no people as the main subject, no text, no labels, no logos, no UI."
+  ].filter(Boolean).join("\n");
+}
+
+async function generateTripImageWithRunware(input) {
+  const taskUUID = randomUUID();
+  const task = {
+    taskType: "imageInference",
+    taskUUID,
+    model: RUNWARE_RECIPE_REMIX_MODEL,
+    positivePrompt: buildTripRunwarePrompt(input),
+    width: 1024,
+    height: 1024
+  };
+
+  const data = await fetchRunwareRecipeRemixBatch([task]);
+  const item = data.find((candidate) => safeString(candidate?.taskUUID).trim() === taskUUID) || data[0];
+  const imageURL = safeString(item?.imageURL).trim();
+  if (!imageURL) return null;
+
+  const imageBase64 = await fetchRunwareImageAsBase64(imageURL).catch(() => "");
+  if (!imageBase64) return null;
+
+  const cost = Number(item?.cost);
+  return {
+    imageBase64,
+    mimeType: "image/jpeg",
+    imageUUID: safeString(item?.imageUUID).trim() || undefined,
+    costUsd: Number.isFinite(cost) && cost >= 0 ? cost : undefined
+  };
+}
+
+// --------------------------------------------------
 // HEALTH CHECK
 // --------------------------------------------------
 app.get("/", (req, res) => {
@@ -1489,6 +1606,87 @@ app.post(
     return res.status(502).json({ error: "Route calculation is temporarily unavailable." });
   }
 });
+
+// --------------------------------------------------
+// TRIP LIVE IMAGE — RUNWARE
+// Expects: { modeKey, destination, dates?, tripGoal?, result }
+// Returns one base64 JPEG. Text generation is already complete before Android calls this.
+// --------------------------------------------------
+app.post(
+  "/trip_image",
+  phase3NetworkGate,
+  requireFirebaseIdToken,
+  verifyLinklyfeAppCheck,
+  phase3UserGate,
+  ...phase3TripImageLimits,
+  async (req, res) => {
+    try {
+      const validationError = validateTripImageBody(req.body || {});
+      if (validationError) return respondPhase3ValidationError(res, validationError);
+
+      if (!RUNWARE_API_KEY) {
+        logMonitoringEvent(req, "provider_config_missing", { provider: "runware" });
+        return res.status(503).json({
+          error: true,
+          message: "Trip images are temporarily unavailable."
+        });
+      }
+
+      const input = {
+        modeKey: safeString(req.body.modeKey).trim(),
+        destination: safeString(req.body.destination).trim(),
+        dates: safeString(req.body.dates).trim(),
+        tripGoal: safeString(req.body.tripGoal).trim(),
+        result: safeString(req.body.result)
+      };
+
+      const startedAt = Date.now();
+      logMonitoringEvent(req, "trip_image_started", {
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        modeKey: input.modeKey,
+        timeoutMs: 20000
+      });
+
+      const image = await generateTripImageWithRunware(input);
+      const generationMs = Date.now() - startedAt;
+
+      if (!image) {
+        logMonitoringEvent(req, "trip_image_empty", { modeKey: input.modeKey });
+        return res.status(502).json({
+          error: true,
+          message: "Trip images are temporarily unavailable."
+        });
+      }
+
+      logMonitoringEvent(req, "trip_image_completed", {
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        modeKey: input.modeKey,
+        generationMs
+      });
+
+      return res.json({
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        ...image,
+        generationMs
+      });
+    } catch (err) {
+      logBackendError(req, "trip_image_failed", err, {
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        timedOut: err?.name === "AbortError",
+        runwareCode: safeString(err?.runwareCode).slice(0, 100) || undefined,
+        runwareParameter: safeString(err?.runwareParameter).slice(0, 120) || undefined
+      });
+      return res.status(502).json({
+        error: true,
+        message: "Trip images are temporarily unavailable."
+      });
+    }
+  }
+);
 
 // --------------------------------------------------
 // RECIPE REMIX LIVE IMAGES — RUNWARE FLUX.2 [klein] 4B
