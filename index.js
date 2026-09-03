@@ -1358,30 +1358,22 @@ async function generateRecipeRemixImagesWithRunware({
 // TRIP LIVE IMAGE HELPERS (RUNWARE)
 // --------------------------------------------------
 
-function cleanTripImageContext(raw, maxLength = 2200) {
-  return safeString(raw)
-    .replace(/\*\*/g, "")
-    .replace(/^\s*#{1,6}\s*/gm, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, maxLength);
-}
-
-function buildTripRunwarePrompt({ modeKey, destination, dates, tripGoal, result }) {
+function buildTripRunwarePrompt({ modeKey, destination, dates, tripGoal }) {
   const modeDirection = modeKey === "trip/highlights"
-    ? "Create one representative destination image for a travel discovery guide."
-    : "Create one representative destination/trip image for a day-by-day itinerary overview.";
+    ? "Create one clean destination photograph that captures a recognizable highlight or defining atmosphere of the place."
+    : "Create one clean destination photograph suitable as the hero image for a trip plan.";
 
   return [
-    "Photorealistic travel photography for a modern trip-planning app.",
+    "Generate a single photorealistic travel photograph, as if captured by one camera in one moment.",
     modeDirection,
     `Destination: ${destination}.`,
-    dates ? `Travel dates / season context: ${dates}.` : "",
-    tripGoal ? `Trip focus: ${tripGoal}.` : "",
-    result ? `Use this completed trip result only as visual context: ${cleanTripImageContext(result)}` : "",
-    "Show a believable, visually strong scene that feels recognizably connected to the destination or its defining atmosphere.",
-    "Prefer a broad scenic or landmark-oriented composition over a close-up object. Natural light, realistic colors, editorial travel-photo quality.",
-    "One coherent image only. No collage, no map, no itinerary graphics, no people as the main subject, no text, no labels, no logos, no UI."
+    dates ? `Season/date context only: ${dates}.` : "",
+    tripGoal ? `Use this only to choose the mood or type of scenery: ${tripGoal}.` : "",
+    "Choose one believable scenic or landmark-oriented view strongly associated with the destination. Use one continuous composition and one camera viewpoint.",
+    "Natural light, realistic colors, realistic architecture and landscape, editorial travel-photography quality.",
+    "ABSOLUTELY NO collage, diptych, split screen, side-by-side images, montage, multiple panels, inset pictures, picture-in-picture, poster, brochure, map, itinerary, schedule, cards, document, phone screen, UI, infographic, or graphic-design layout.",
+    "ABSOLUTELY NO readable words, letters, numbers, captions, labels, titles, dates, notes, logos, watermarks, signs, banners, or typography anywhere in the image.",
+    "Do not visualize the written trip plan. Do not add explanatory information. Output only the photographic scene."
   ].filter(Boolean).join("\n");
 }
 
