@@ -50,8 +50,16 @@ const { getAuth } = require("firebase-admin/auth");
 const { getAppCheck } = require("firebase-admin/app-check");
 const { randomUUID } = require("crypto");
 
+// Load .env variables
 dotenv.config();
 
+// --------------------------------------------------
+// FIREBASE ADMIN AUTHENTICATION (PHASE 2)
+// --------------------------------------------------
+// Preferred on Render: store the service-account JSON only in the protected
+// FIREBASE_SERVICE_ACCOUNT_JSON environment variable. Never commit it to GitHub.
+// GOOGLE_APPLICATION_CREDENTIALS remains supported for deployments that use a
+// protected service-account file / Application Default Credentials instead.
 function initializeLinklyfeFirebaseAdmin() {
   if (getApps().length > 0) return getApps()[0];
 
@@ -84,20 +92,30 @@ try {
   process.exit(1);
 }
 
+// Ensure OpenAI key exists
 if (!process.env.OPENAI_API_KEY) {
   console.error("❌ Missing OPENAI_API_KEY in .env");
   process.exit(1);
 }
 
+// SerpApi (DuckDuckGo) key for Evidence Search
 const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY;
+// Shared restricted Google Maps Platform key: Places API (New) + Routes API only.
 const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || "";
 
+// Recipe Remix live images (server-side only; never expose this key to Android).
+// The endpoint is optional: if RUNWARE_API_KEY is absent, every existing LinkLyfe
+// route continues to start and work normally.
 const RUNWARE_API_KEY = String(process.env.RUNWARE_API_KEY || "").trim();
 const RUNWARE_API_URL = "https://api.runware.ai/v1";
 const RUNWARE_RECIPE_REMIX_MODEL =
   String(process.env.RUNWARE_RECIPE_REMIX_MODEL || "runware:400@4").trim() ||
   "runware:400@4";
 
+// Phase 5 App Check rollout:
+// - monitor (default): verify/log tokens but never block an otherwise authenticated request.
+// - enforce: reject missing/invalid App Check tokens.
+// Keep monitor during initial rollout so existing installed versions are not broken.
 const APP_CHECK_ENFORCEMENT_MODE =
   String(process.env.APP_CHECK_ENFORCEMENT_MODE || "monitor")
     .trim()
@@ -111,6 +129,10 @@ const client = new OpenAI({
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// --------------------------------------------------
+// PHASE 4 — RESPONSE SECURITY + SAFE REQUEST LOGGING
+// --------------------------------------------------
 
 const defaultCorsOrigins = [
   "https://linklyfe.com",
@@ -131,13 +153,19 @@ app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
-  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader(
+    "Permissions-Policy",
+    "camera=(), microphone=(), geolocation=()"
+  );
   res.setHeader(
     "Content-Security-Policy",
     "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
   );
   res.setHeader("Cache-Control", "no-store");
-  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  res.setHeader(
+    "Strict-Transport-Security",
+    "max-age=31536000; includeSubDomains"
+  );
   next();
 });
 
@@ -189,6 +217,7 @@ app.use((req, res, next) => {
 
 app.use(cors({
   origin(origin, callback) {
+    // Native Android/server-to-server requests normally have no Origin header.
     if (!origin) return callback(null, true);
     return callback(null, allowedCorsOrigins.has(origin));
   },
@@ -221,7 +250,10 @@ function safeBackendErrorMeta(err) {
   }
 
   return {
-    errorName: typeof err?.name === "string" ? err.name.slice(0, 80) : "Error",
+    errorName:
+      typeof err?.name === "string"
+        ? err.name.slice(0, 80)
+        : "Error",
     errorCode: rawCode || undefined,
     upstreamStatus: upstreamStatus || undefined
   };
@@ -246,6 +278,9 @@ function logMonitoringEvent(req, event, extra = {}) {
   }));
 }
 
+// Phase 3: bound request bodies before any expensive work.
+// 96 KB comfortably covers current LinkLyfe prompts/forms while preventing
+// unbounded JSON payloads from reaching Firebase/OpenAI/Google/SerpApi paths.
 app.use(express.json({
   limit: "96kb",
   strict: true
@@ -283,7 +318,10 @@ async function requireFirebaseIdToken(req, res, next) {
   const idToken = bearerTokenFromRequest(req);
   if (!idToken) {
     logMonitoringEvent(req, "auth_rejected", { reason: "missing_token" });
-    return res.status(401).json({ error: true, message: "Authentication required." });
+    return res.status(401).json({
+      error: true,
+      message: "Authentication required."
+    });
   }
 
   try {
@@ -296,9 +334,13 @@ async function requireFirebaseIdToken(req, res, next) {
     return next();
   } catch (_) {
     logMonitoringEvent(req, "auth_rejected", { reason: "invalid_token" });
-    return res.status(401).json({ error: true, message: "Authentication required." });
+    return res.status(401).json({
+      error: true,
+      message: "Authentication required."
+    });
   }
 }
+
 
 function firebaseAppCheckTokenFromRequest(req) {
   const value = req.headers["x-firebase-appcheck"];
@@ -316,17 +358,26 @@ async function verifyLinklyfeAppCheck(req, res, next) {
     });
 
     if (APP_CHECK_ENFORCEMENT_MODE === "enforce") {
-      return res.status(401).json({ error: true, message: "App verification required." });
+      return res.status(401).json({
+        error: true,
+        message: "App verification required."
+      });
     }
+
     return next();
   }
 
   try {
     const decodedAppCheck = await getAppCheck().verifyToken(appCheckToken);
+
     req.linklyfeAppCheck = {
       status: "verified",
-      appId: typeof decodedAppCheck?.app_id === "string" ? decodedAppCheck.app_id : ""
+      appId:
+        typeof decodedAppCheck?.app_id === "string"
+          ? decodedAppCheck.app_id
+          : ""
     };
+
     return next();
   } catch (_) {
     req.linklyfeAppCheck = { status: "invalid" };
@@ -336,11 +387,24 @@ async function verifyLinklyfeAppCheck(req, res, next) {
     });
 
     if (APP_CHECK_ENFORCEMENT_MODE === "enforce") {
-      return res.status(401).json({ error: true, message: "App verification required." });
+      return res.status(401).json({
+        error: true,
+        message: "App verification required."
+      });
     }
+
     return next();
   }
 }
+
+
+// --------------------------------------------------
+// PHASE 3 — RATE LIMITING + REQUEST VALIDATION
+// --------------------------------------------------
+// This limiter is intentionally dependency-free so the patch does not change
+// package.json/package-lock.json. It protects both authenticated UID and a
+// best-effort network key. If the service is horizontally scaled later, move
+// the limiter state to a shared store such as Redis.
 
 const phase3RateBuckets = new Map();
 const PHASE3_RATE_BUCKET_TTL_MS = 30 * 60 * 1000;
@@ -353,6 +417,8 @@ function normalizedNetworkPart(value) {
 }
 
 function requestNetworkKey(req) {
+  // Managed proxies normally append to X-Forwarded-For. Taking the right-most
+  // entry avoids trusting a client-supplied left-most value when one exists.
   const forwarded = typeof req.headers["x-forwarded-for"] === "string"
     ? req.headers["x-forwarded-for"]
         .split(",")
@@ -360,7 +426,9 @@ function requestNetworkKey(req) {
         .filter(Boolean)
     : [];
 
-  const forwardedCandidate = forwarded.length ? forwarded[forwarded.length - 1] : "";
+  const forwardedCandidate = forwarded.length
+    ? forwarded[forwarded.length - 1]
+    : "";
 
   return forwardedCandidate ||
     normalizedNetworkPart(req.socket?.remoteAddress) ||
@@ -375,7 +443,10 @@ function prunePhase3RateBuckets(now = Date.now()) {
   }
 }
 
-const phase3RatePruneTimer = setInterval(() => prunePhase3RateBuckets(), 5 * 60 * 1000);
+const phase3RatePruneTimer = setInterval(
+  () => prunePhase3RateBuckets(),
+  5 * 60 * 1000
+);
 phase3RatePruneTimer.unref?.();
 
 function consumePhase3RateLimit(scope, identity, limit, windowMs) {
@@ -384,7 +455,11 @@ function consumePhase3RateLimit(scope, identity, limit, windowMs) {
   let bucket = phase3RateBuckets.get(key);
 
   if (!bucket || now >= bucket.resetAt) {
-    bucket = { count: 0, resetAt: now + windowMs, lastSeenAt: now };
+    bucket = {
+      count: 0,
+      resetAt: now + windowMs,
+      lastSeenAt: now
+    };
   }
 
   bucket.count += 1;
@@ -394,14 +469,25 @@ function consumePhase3RateLimit(scope, identity, limit, windowMs) {
   if (bucket.count > limit) {
     return {
       blocked: true,
-      retryAfterSeconds: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000))
+      retryAfterSeconds: Math.max(
+        1,
+        Math.ceil((bucket.resetAt - now) / 1000)
+      )
     };
   }
 
-  return { blocked: false, retryAfterSeconds: 0 };
+  return {
+    blocked: false,
+    retryAfterSeconds: 0
+  };
 }
 
-function phase3RateLimitMiddleware({ scope, limit, windowMs, identity }) {
+function phase3RateLimitMiddleware({
+  scope,
+  limit,
+  windowMs,
+  identity
+}) {
   return (req, res, next) => {
     const identityValue = String(identity(req) || "").trim();
     if (!identityValue) {
@@ -412,7 +498,13 @@ function phase3RateLimitMiddleware({ scope, limit, windowMs, identity }) {
       });
     }
 
-    const result = consumePhase3RateLimit(scope, identityValue, limit, windowMs);
+    const result = consumePhase3RateLimit(
+      scope,
+      identityValue,
+      limit,
+      windowMs
+    );
+
     if (result.blocked) {
       logMonitoringEvent(req, "rate_limit_blocked", {
         scope,
@@ -460,48 +552,104 @@ function phase3UserEndpointLimits(name, burstLimit, sustainedLimit) {
   ];
 }
 
-const phase3GenerateLimits = phase3UserEndpointLimits("generate", 6, 24);
+const phase3GenerateLimits = phase3UserEndpointLimits(
+  "generate",
+  6,
+  24
+);
 
-// One request can create up to four title-matched visual-result images in one Runware batch.
-// Recipe Remix itself remains capped at three by its existing parser.
+// One request can create up to three Recipe Remix images or up to four supported normal-mode images
+// in a single Runware batch. Keep the same full-run cadence as /generate so image traffic cannot
+// be used as a cheap unauthenticated or unbounded media-generation proxy.
 const phase3RecipeRemixImageLimits = phase3UserEndpointLimits(
   "recipe-remix-images",
   6,
   24
 );
 
-const phase3TripImageLimits = phase3UserEndpointLimits("trip-image", 6, 24);
-const phase3AgentSmithLimits = phase3UserEndpointLimits("agent-smith", 4, 12);
-const phase3EvidenceSearchLimits = phase3UserEndpointLimits("evidence-search", 8, 30);
-const phase3PlaceAutosuggestLimits = phase3UserEndpointLimits("place-autosuggest", 45, 150);
-const phase3RouteComputeLimits = phase3UserEndpointLimits("route-compute", 8, 20);
+// Trip images create one Runware image per completed Trip result. Keep the same
+// protected cadence as the existing image endpoint without sharing its counter.
+const phase3TripImageLimits = phase3UserEndpointLimits(
+  "trip-image",
+  6,
+  24
+);
+const phase3AgentSmithLimits = phase3UserEndpointLimits(
+  "agent-smith",
+  4,
+  12
+);
+const phase3EvidenceSearchLimits = phase3UserEndpointLimits(
+  "evidence-search",
+  8,
+  30
+);
+const phase3PlaceAutosuggestLimits = phase3UserEndpointLimits(
+  "place-autosuggest",
+  45,
+  150
+);
+const phase3RouteComputeLimits = phase3UserEndpointLimits(
+  "route-compute",
+  8,
+  20
+);
 
 function isJsonObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+  return value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value);
 }
 
 function validateAllowedKeys(value, allowedKeys) {
-  if (!isJsonObject(value)) return "Request body must be a JSON object.";
+  if (!isJsonObject(value)) {
+    return "Request body must be a JSON object.";
+  }
+
   const allowed = new Set(allowedKeys);
-  return Object.keys(value).some((key) => !allowed.has(key))
+  const hasUnknownKey = Object.keys(value).some((key) => !allowed.has(key));
+  return hasUnknownKey
     ? "Request contains unsupported fields."
     : "";
 }
 
-function validateStringValue(value, { fieldName, required = false, minLength = 0, maxLength }) {
-  if (value === undefined || value === null) return required ? `${fieldName} is required.` : "";
-  if (typeof value !== "string") return `${fieldName} must be a string.`;
+function validateStringValue(
+  value,
+  {
+    fieldName,
+    required = false,
+    minLength = 0,
+    maxLength
+  }
+) {
+  if (value === undefined || value === null) {
+    return required ? `${fieldName} is required.` : "";
+  }
+
+  if (typeof value !== "string") {
+    return `${fieldName} must be a string.`;
+  }
 
   const trimmedLength = value.trim().length;
-  if (required && trimmedLength === 0) return `${fieldName} is required.`;
-  if (trimmedLength < minLength) return `${fieldName} is too short.`;
-  if (typeof maxLength === "number" && value.length > maxLength) return `${fieldName} is too long.`;
+  if (required && trimmedLength === 0) {
+    return `${fieldName} is required.`;
+  }
+
+  if (trimmedLength < minLength) {
+    return `${fieldName} is too short.`;
+  }
+
+  if (typeof maxLength === "number" && value.length > maxLength) {
+    return `${fieldName} is too long.`;
+  }
+
   return "";
 }
 
 function validateSimplePromptBody(body, maxLength) {
   const shapeError = validateAllowedKeys(body, ["prompt"]);
   if (shapeError) return shapeError;
+
   return validateStringValue(body.prompt, {
     fieldName: "prompt",
     required: true,
@@ -519,8 +667,13 @@ const RUNWARE_SHARED_RESULT_IMAGE_MODE_KEYS = new Set([
 ]);
 
 function validateRequestedTitles(value) {
-  if (!Array.isArray(value)) return "requestedTitles must be an array.";
-  if (value.length < 1 || value.length > 4) return "requestedTitles must contain between 1 and 4 items.";
+  if (!Array.isArray(value)) {
+    return "requestedTitles must be an array.";
+  }
+
+  if (value.length < 1 || value.length > 4) {
+    return "requestedTitles must contain between 1 and 4 items.";
+  }
 
   for (let index = 0; index < value.length; index += 1) {
     const error = validateStringValue(value[index], {
@@ -531,6 +684,7 @@ function validateRequestedTitles(value) {
     });
     if (error) return error;
   }
+
   return "";
 }
 
@@ -558,6 +712,7 @@ function validateRecipeRemixImagesBody(body) {
     if (!RUNWARE_SHARED_RESULT_IMAGE_MODE_KEYS.has(modeKey)) {
       return "modeKey is not supported for result images.";
     }
+
     const titlesError = validateRequestedTitles(body.requestedTitles);
     if (titlesError) return titlesError;
   } else if (body.requestedTitles !== undefined) {
@@ -651,10 +806,19 @@ function validateRouteLocationObject(value, fieldName) {
 }
 
 function respondPhase3ValidationError(res, message) {
-  const safeReason = typeof message === "string" ? message.slice(0, 160) : "invalid_request";
+  const safeReason = typeof message === "string"
+    ? message.slice(0, 160)
+    : "invalid_request";
   logMonitoringEvent(res?.req, "validation_rejected", { reason: safeReason });
-  return res.status(400).json({ error: true, message });
+  return res.status(400).json({
+    error: true,
+    message
+  });
 }
+
+// --------------------------------------------------
+// HELPERS (Evidence Search)
+// --------------------------------------------------
 
 function safeString(x) {
   return typeof x === "string" ? x : "";
@@ -689,28 +853,56 @@ function tokenizeComparableText(text) {
     .filter(Boolean);
 }
 
+// Very simple credibility heuristic (Phase 3b-ready; replace later)
 function credibilityScoreFor(url, source) {
   const d = (extractDomain(url) || "").toLowerCase();
+  const s = (safeString(source) || "").toLowerCase();
+
   const high = [
-    "reuters.com", "apnews.com", "bbc.co.uk", "bbc.com", "ft.com", "wsj.com",
-    "economist.com", "investopedia.com", "sec.gov", "federalreserve.gov", "bls.gov",
-    "whitehouse.gov", "cdc.gov", "nih.gov", "who.int", "oecd.org", "worldbank.org",
-    "imf.org", "nber.org", "nature.com", "science.org"
+    "reuters.com",
+    "apnews.com",
+    "bbc.co.uk",
+    "bbc.com",
+    "ft.com",
+    "wsj.com",
+    "economist.com",
+    "investopedia.com",
+    "sec.gov",
+    "federalreserve.gov",
+    "bls.gov",
+    "whitehouse.gov",
+    "cdc.gov",
+    "nih.gov",
+    "who.int",
+    "oecd.org",
+    "worldbank.org",
+    "imf.org",
+    "nber.org",
+    "nature.com",
+    "science.org"
   ];
+
   const mid = [
-    "wikipedia.org", "nerdwallet.com", "bankrate.com", "morningstar.com", "khanacademy.org"
+    "wikipedia.org",
+    "nerdwallet.com",
+    "bankrate.com",
+    "morningstar.com",
+    "khanacademy.org"
   ];
+
   if (high.includes(d)) return 86;
   if (mid.includes(d)) return 78;
   if (d) return 72;
   return 60;
 }
 
+
 function googleAutocompleteContextTail(contextText) {
   const parts = normalizePlaceQuery(contextText)
     .split(",")
     .map((part) => part.trim())
     .filter(Boolean);
+
   if (parts.length >= 3) return parts.slice(-3).join(", ");
   if (parts.length >= 2) return parts.slice(-2).join(", ");
   return "";
@@ -719,37 +911,52 @@ function googleAutocompleteContextTail(contextText) {
 function googleAutocompleteInput(query, contextText) {
   const cleanedQuery = normalizePlaceQuery(query);
   const tail = googleAutocompleteContextTail(contextText);
+
   if (!tail) return cleanedQuery;
+
   const normalizedQuery = normalizeComparableText(cleanedQuery);
   const normalizedTail = normalizeComparableText(tail);
-  if (normalizedTail && normalizedQuery.includes(normalizedTail)) return cleanedQuery;
+
+  // Avoid duplicating region words the user already typed.
+  if (normalizedTail && normalizedQuery.includes(normalizedTail)) {
+    return cleanedQuery;
+  }
+
   return `${cleanedQuery}, ${tail}`;
 }
 
 async function fetchGooglePlacePredictions(query, contextText) {
-  if (!GOOGLE_PLACES_API_KEY) throw new Error("Missing GOOGLE_PLACES_API_KEY in environment.");
+  if (!GOOGLE_PLACES_API_KEY) {
+    throw new Error("Missing GOOGLE_PLACES_API_KEY in environment.");
+  }
 
   const input = googleAutocompleteInput(query, contextText);
-  const response = await fetch("https://places.googleapis.com/v1/places:autocomplete", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-      "X-Goog-FieldMask": [
-        "suggestions.placePrediction.placeId",
-        "suggestions.placePrediction.text.text",
-        "suggestions.placePrediction.structuredFormat.mainText.text",
-        "suggestions.placePrediction.structuredFormat.secondaryText.text"
-      ].join(",")
-    },
-    body: JSON.stringify({
-      input,
-      includeQueryPredictions: false,
-      languageCode: "en"
-    })
-  });
+  const response = await fetch(
+    "https://places.googleapis.com/v1/places:autocomplete",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask": [
+          "suggestions.placePrediction.placeId",
+          "suggestions.placePrediction.text.text",
+          "suggestions.placePrediction.structuredFormat.mainText.text",
+          "suggestions.placePrediction.structuredFormat.secondaryText.text"
+        ].join(",")
+      },
+      body: JSON.stringify({
+        input,
+        includeQueryPredictions: false,
+        languageCode: "en"
+      })
+    }
+  );
 
-  if (!response.ok) throw new Error(`Google Places autocomplete failed with status ${response.status}`);
+  if (!response.ok) {
+    throw new Error(`Google Places autocomplete failed with status ${response.status}`);
+  }
+
   const data = await response.json();
   return Array.isArray(data?.suggestions) ? data.suggestions : [];
 }
@@ -762,6 +969,7 @@ function googlePlaceSuggestionFromPrediction(suggestion) {
   const title = safeString(prediction?.structuredFormat?.mainText?.text).trim();
   const subtitle = safeString(prediction?.structuredFormat?.secondaryText?.text).trim();
   const fullText = safeString(prediction?.text?.text).trim();
+
   if (!placeId || (!title && !fullText)) return null;
 
   return {
@@ -773,6 +981,7 @@ function googlePlaceSuggestionFromPrediction(suggestion) {
     lng: null
   };
 }
+
 
 function routeInputText(value) {
   return safeString(value?.text).trim();
@@ -788,6 +997,7 @@ function googleRouteWaypoint(value, contextText = "") {
 
   let address = routeInputText(value);
   const context = safeString(contextText).trim();
+
   if (address && context) {
     const comparableAddress = normalizeComparableText(address);
     const comparableContext = normalizeComparableText(context);
@@ -795,6 +1005,7 @@ function googleRouteWaypoint(value, contextText = "") {
       address = `${address}, ${context}`;
     }
   }
+
   return address ? { address } : null;
 }
 
@@ -820,39 +1031,57 @@ function routePointResponse(value) {
 }
 
 async function fetchGoogleRouteSegment(points, contextText = "") {
-  if (!GOOGLE_PLACES_API_KEY) throw new Error("Google Maps Platform is not configured.");
-  if (!Array.isArray(points) || points.length < 2) throw new Error("A route segment needs at least two points.");
+  if (!GOOGLE_PLACES_API_KEY) {
+    throw new Error("Google Maps Platform is not configured.");
+  }
+  if (!Array.isArray(points) || points.length < 2) {
+    throw new Error("A route segment needs at least two points.");
+  }
 
   const origin = googleRouteWaypoint(points[0], contextText);
   const destination = googleRouteWaypoint(points[points.length - 1], contextText);
-  const intermediates = points.slice(1, -1).map((point) => googleRouteWaypoint(point, contextText)).filter(Boolean);
-  if (!origin || !destination) throw new Error("Route origin and destination are required.");
+  const intermediates = points
+    .slice(1, -1)
+    .map((point) => googleRouteWaypoint(point, contextText))
+    .filter(Boolean);
 
-  const response = await fetch("https://routes.googleapis.com/directions/v2:computeRoutes", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-      "X-Goog-FieldMask": [
-        "routes.distanceMeters",
-        "routes.duration",
-        "routes.legs.distanceMeters",
-        "routes.legs.duration"
-      ].join(",")
-    },
-    body: JSON.stringify({
-      origin,
-      destination,
-      intermediates,
-      travelMode: "DRIVE",
-      computeAlternativeRoutes: false
-    })
-  });
+  if (!origin || !destination) {
+    throw new Error("Route origin and destination are required.");
+  }
 
-  if (!response.ok) throw new Error(`Google Routes failed with status ${response.status}`);
+  const response = await fetch(
+    "https://routes.googleapis.com/directions/v2:computeRoutes",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask": [
+          "routes.distanceMeters",
+          "routes.duration",
+          "routes.legs.distanceMeters",
+          "routes.legs.duration"
+        ].join(",")
+      },
+      body: JSON.stringify({
+        origin,
+        destination,
+        intermediates,
+        travelMode: "DRIVE",
+        computeAlternativeRoutes: false
+      })
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Google Routes failed with status ${response.status}`);
+  }
+
   const data = await response.json();
   const route = Array.isArray(data?.routes) ? data.routes[0] : null;
-  if (!route) throw new Error("Google Routes returned no route.");
+  if (!route) {
+    throw new Error("Google Routes returned no route.");
+  }
 
   const legs = Array.isArray(route?.legs)
     ? route.legs.map((leg) => ({
@@ -885,9 +1114,13 @@ async function computeGoogleOrderedRoute(allPoints, contextText = "") {
 
   let startIndex = 0;
   while (startIndex < allPoints.length - 1) {
-    const endIndex = Math.min(allPoints.length - 1, startIndex + MAX_POINTS_PER_ESSENTIALS_REQUEST - 1);
+    const endIndex = Math.min(
+      allPoints.length - 1,
+      startIndex + MAX_POINTS_PER_ESSENTIALS_REQUEST - 1
+    );
     const segmentPoints = allPoints.slice(startIndex, endIndex + 1);
     const segment = await fetchGoogleRouteSegment(segmentPoints, contextText);
+
     allLegs.push(...segment.legs);
     totalDistanceMeters += segment.distanceMeters || 0;
     totalDurationSeconds += segment.durationSeconds || 0;
@@ -899,8 +1132,17 @@ async function computeGoogleOrderedRoute(allPoints, contextText = "") {
     throw new Error("Google Routes returned an unexpected leg count.");
   }
 
-  return { legs: allLegs, totalDistanceMeters, totalDurationSeconds, segmentCount };
+  return {
+    legs: allLegs,
+    totalDistanceMeters,
+    totalDurationSeconds,
+    segmentCount
+  };
 }
+
+// --------------------------------------------------
+// RECIPE REMIX LIVE IMAGE HELPERS (RUNWARE)
+// --------------------------------------------------
 
 function cleanRecipeRemixImageText(raw, maxLength = 1800) {
   return safeString(raw)
@@ -915,10 +1157,12 @@ function recipeRemixNamedTitleMatch(line) {
   const value = safeString(line).trim();
   if (!value) return null;
 
+  // Normal contract form: 1. **Street Corn Chicken Bowl**
   let match = value.match(
     /^(?:#{1,4}\s*)?(\d{1,2})[.)]\s+\*\*([^*]{3,100})\*\*(?:\s*[:—–-]\s*(.*))?$/
   );
 
+  // Defensive alternate: **1. Street Corn Chicken Bowl**
   if (!match) {
     match = value.match(
       /^(?:#{1,4}\s*)?\*\*(\d{1,2})[.)]\s+([^*]{3,100})\*\*(?:\s*[:—–-]\s*(.*))?$/
@@ -982,8 +1226,12 @@ function extractRecipeRemixImageSections(rawResult) {
   if (starts.length === 0) return [];
 
   return starts.map((start, position) => {
-    let endIndex = position + 1 < starts.length ? starts[position + 1].index : lines.length;
+    let endIndex =
+      position + 1 < starts.length
+        ? starts[position + 1].index
+        : lines.length;
 
+    // Do not absorb optional top-level sections into the third image description.
     for (let index = start.index + 1; index < endIndex; index += 1) {
       if (isRecipeRemixFollowingTopLevelHeading(lines[index])) {
         endIndex = index;
@@ -1062,6 +1310,9 @@ async function fetchRunwareRecipeRemixBatch(tasks) {
       signal: controller.signal
     });
 
+    // Always read Runware's JSON body before deciding success/failure. Their error
+    // payload identifies the rejected parameter/code; keeping those two fields on
+    // the thrown error gives Render useful diagnostics without logging user prompts.
     const payload = await response.json().catch(() => ({}));
     const data = Array.isArray(payload?.data) ? payload.data : [];
     const upstreamErrors = Array.isArray(payload?.errors) ? payload.errors : [];
@@ -1130,6 +1381,10 @@ async function generateRecipeRemixImagesWithRunware({
     })
   }));
 
+  // Keep the Runware request intentionally minimal and aligned to the documented
+  // text-to-image REST example. Runware returns its default temporary imageURL;
+  // LinkLyfe immediately downloads that URL server-side and sends base64 to Android,
+  // so the app never depends on loading a Runware-hosted URL itself.
   const tasks = taskMeta.map((item) => ({
     taskType: "imageInference",
     taskUUID: item.taskUUID,
@@ -1169,7 +1424,10 @@ async function generateRecipeRemixImagesWithRunware({
   return resolved.filter(Boolean);
 }
 
-async function generateSharedResultImagesWithRunware({ modeKey, requestedTitles }) {
+async function generateSharedResultImagesWithRunware({
+  modeKey,
+  requestedTitles
+}) {
   const taskMeta = requestedTitles.slice(0, 4).map((title) => ({
     taskUUID: randomUUID(),
     title,
@@ -1214,6 +1472,10 @@ async function generateSharedResultImagesWithRunware({ modeKey, requestedTitles 
 
   return resolved.filter(Boolean);
 }
+
+// --------------------------------------------------
+// TRIP LIVE IMAGE HELPERS (RUNWARE)
+// --------------------------------------------------
 
 function buildTripRunwarePrompt({ modeKey, destination, dates, tripGoal }) {
   const modeDirection = modeKey === "trip/highlights"
@@ -1262,10 +1524,19 @@ async function generateTripImageWithRunware(input) {
   };
 }
 
+// --------------------------------------------------
+// HEALTH CHECK
+// --------------------------------------------------
 app.get("/", (req, res) => {
   res.json({ status: "ok", message: "HelloAI backend is running 🚀" });
 });
 
+// --------------------------------------------------
+// GOOGLE PLACES AUTOCOMPLETE (DISTANCE ROUTE PLANNER)
+// Expects: { query: string, contextText?: string }
+// Returns Google place predictions only; no Place Details request is made.
+// Free-form typing remains valid if no suggestion is selected.
+// --------------------------------------------------
 app.post(
   "/place_autosuggest",
   phase3NetworkGate,
@@ -1274,50 +1545,67 @@ app.post(
   phase3UserGate,
   ...phase3PlaceAutosuggestLimits,
   async (req, res) => {
-    try {
-      const bodyShapeError = validateAllowedKeys(req.body, ["query", "contextText"]);
-      if (bodyShapeError) return respondPhase3ValidationError(res, bodyShapeError);
-
-      const queryTypeError = validateStringValue(req.body.query, {
-        fieldName: "query",
-        required: true,
-        minLength: 3,
-        maxLength: 180
-      });
-      if (queryTypeError) return respondPhase3ValidationError(res, queryTypeError);
-
-      const contextTypeError = validateStringValue(req.body.contextText, {
-        fieldName: "contextText",
-        required: false,
-        maxLength: 220
-      });
-      if (contextTypeError) return respondPhase3ValidationError(res, contextTypeError);
-
-      const query = normalizePlaceQuery(req.body.query);
-      const contextText = normalizePlaceQuery(req.body.contextText);
-
-      if (!GOOGLE_PLACES_API_KEY) {
-        logMonitoringEvent(req, "provider_config_missing", { provider: "google_places" });
-        return res.status(503).json({ error: "Place suggestions are temporarily unavailable." });
-      }
-
-      const rawSuggestions = await fetchGooglePlacePredictions(query, contextText);
-      const items = [];
-
-      for (const suggestion of rawSuggestions) {
-        if (items.length >= 5) break;
-        const item = googlePlaceSuggestionFromPrediction(suggestion);
-        if (item) items.push(item);
-      }
-
-      return res.json({ provider: "google_maps", items });
-    } catch (err) {
-      logBackendError(req, "place_autosuggest_failed", err);
-      return res.status(502).json({ error: "Place suggestions are temporarily unavailable." });
+  try {
+    const bodyShapeError = validateAllowedKeys(
+      req.body,
+      ["query", "contextText"]
+    );
+    if (bodyShapeError) {
+      return respondPhase3ValidationError(res, bodyShapeError);
     }
-  }
-);
 
+    const queryTypeError = validateStringValue(req.body.query, {
+      fieldName: "query",
+      required: true,
+      minLength: 3,
+      maxLength: 180
+    });
+    if (queryTypeError) {
+      return respondPhase3ValidationError(res, queryTypeError);
+    }
+
+    const contextTypeError = validateStringValue(req.body.contextText, {
+      fieldName: "contextText",
+      required: false,
+      maxLength: 220
+    });
+    if (contextTypeError) {
+      return respondPhase3ValidationError(res, contextTypeError);
+    }
+
+    const query = normalizePlaceQuery(req.body.query);
+    const contextText = normalizePlaceQuery(req.body.contextText);
+
+    if (!GOOGLE_PLACES_API_KEY) {
+      logMonitoringEvent(req, "provider_config_missing", { provider: "google_places" });
+      return res.status(503).json({ error: "Place suggestions are temporarily unavailable." });
+    }
+
+    const rawSuggestions = await fetchGooglePlacePredictions(query, contextText);
+    const items = [];
+
+    for (const suggestion of rawSuggestions) {
+      if (items.length >= 5) break;
+      const item = googlePlaceSuggestionFromPrediction(suggestion);
+      if (item) items.push(item);
+    }
+
+    return res.json({
+      provider: "google_maps",
+      items
+    });
+  } catch (err) {
+    logBackendError(req, "place_autosuggest_failed", err);
+    return res.status(502).json({ error: "Place suggestions are temporarily unavailable." });
+  }
+});
+
+// --------------------------------------------------
+// GOOGLE ROUTES — DISTANCE ROUTE PLANNER
+// Selected Google Places predictions use Place IDs.
+// Free-typed entries fall back to address strings.
+// Stop order is preserved; Pro waypoint optimization is not enabled.
+// --------------------------------------------------
 app.post(
   "/route_compute",
   phase3NetworkGate,
@@ -1326,71 +1614,115 @@ app.post(
   phase3UserGate,
   ...phase3RouteComputeLimits,
   async (req, res) => {
-    try {
-      const bodyShapeError = validateAllowedKeys(req.body, ["start", "end", "stops", "contextText"]);
-      if (bodyShapeError) return respondPhase3ValidationError(res, bodyShapeError);
-
-      const startError = validateRouteLocationObject(req.body.start, "start");
-      if (startError) return respondPhase3ValidationError(res, startError);
-
-      const endError = validateRouteLocationObject(req.body.end, "end");
-      if (endError) return respondPhase3ValidationError(res, endError);
-
-      if (!Array.isArray(req.body.stops)) {
-        return respondPhase3ValidationError(res, "stops must be an array.");
-      }
-      if (req.body.stops.length < 1 || req.body.stops.length > 50) {
-        return respondPhase3ValidationError(res, "stops must contain between 1 and 50 items.");
-      }
-
-      for (let index = 0; index < req.body.stops.length; index += 1) {
-        const stopError = validateRouteLocationObject(req.body.stops[index], `stops[${index}]`);
-        if (stopError) return respondPhase3ValidationError(res, stopError);
-      }
-
-      const contextError = validateStringValue(req.body.contextText, {
-        fieldName: "contextText",
-        required: false,
-        maxLength: 240
-      });
-      if (contextError) return respondPhase3ValidationError(res, contextError);
-
-      const start = req.body.start;
-      const end = req.body.end;
-      const rawStops = req.body.stops;
-      const contextText = normalizePlaceQuery(req.body.contextText);
-
-      if (!GOOGLE_PLACES_API_KEY) {
-        logMonitoringEvent(req, "provider_config_missing", { provider: "google_routes" });
-        return res.status(503).json({ error: "Route calculation is temporarily unavailable." });
-      }
-
-      const stops = rawStops.map((value) => ({
-        text: routeInputText(value),
-        placeId: routeInputPlaceId(value)
-      }));
-      const normalizedStart = { text: routeInputText(start), placeId: routeInputPlaceId(start) };
-      const normalizedEnd = { text: routeInputText(end), placeId: routeInputPlaceId(end) };
-      const allPoints = [normalizedStart, ...stops, normalizedEnd];
-      const computed = await computeGoogleOrderedRoute(allPoints, contextText);
-
-      return res.json({
-        provider: "google_routes",
-        start: routePointResponse(normalizedStart),
-        end: routePointResponse(normalizedEnd),
-        stops: stops.map(routePointResponse),
-        legs: computed.legs,
-        totalDistanceMeters: computed.totalDistanceMeters,
-        totalDurationSeconds: computed.totalDurationSeconds,
-        segmentCount: computed.segmentCount
-      });
-    } catch (err) {
-      logBackendError(req, "route_compute_failed", err);
-      return res.status(502).json({ error: "Route calculation is temporarily unavailable." });
+  try {
+    const bodyShapeError = validateAllowedKeys(
+      req.body,
+      ["start", "end", "stops", "contextText"]
+    );
+    if (bodyShapeError) {
+      return respondPhase3ValidationError(res, bodyShapeError);
     }
-  }
-);
 
+    const startError = validateRouteLocationObject(
+      req.body.start,
+      "start"
+    );
+    if (startError) {
+      return respondPhase3ValidationError(res, startError);
+    }
+
+    const endError = validateRouteLocationObject(
+      req.body.end,
+      "end"
+    );
+    if (endError) {
+      return respondPhase3ValidationError(res, endError);
+    }
+
+    if (!Array.isArray(req.body.stops)) {
+      return respondPhase3ValidationError(
+        res,
+        "stops must be an array."
+      );
+    }
+
+    if (req.body.stops.length < 1 || req.body.stops.length > 50) {
+      return respondPhase3ValidationError(
+        res,
+        "stops must contain between 1 and 50 items."
+      );
+    }
+
+    for (let index = 0; index < req.body.stops.length; index += 1) {
+      const stopError = validateRouteLocationObject(
+        req.body.stops[index],
+        `stops[${index}]`
+      );
+      if (stopError) {
+        return respondPhase3ValidationError(res, stopError);
+      }
+    }
+
+    const contextError = validateStringValue(req.body.contextText, {
+      fieldName: "contextText",
+      required: false,
+      maxLength: 240
+    });
+    if (contextError) {
+      return respondPhase3ValidationError(res, contextError);
+    }
+
+    const start = req.body.start;
+    const end = req.body.end;
+    const rawStops = req.body.stops;
+    const contextText = normalizePlaceQuery(req.body.contextText);
+
+    if (!GOOGLE_PLACES_API_KEY) {
+      logMonitoringEvent(req, "provider_config_missing", { provider: "google_routes" });
+      return res.status(503).json({ error: "Route calculation is temporarily unavailable." });
+    }
+
+    const startText = routeInputText(start);
+    const endText = routeInputText(end);
+
+    const stops = rawStops.map((value) => ({
+      text: routeInputText(value),
+      placeId: routeInputPlaceId(value)
+    }));
+
+    const normalizedStart = {
+      text: startText,
+      placeId: routeInputPlaceId(start)
+    };
+    const normalizedEnd = {
+      text: endText,
+      placeId: routeInputPlaceId(end)
+    };
+
+    const allPoints = [normalizedStart, ...stops, normalizedEnd];
+    const computed = await computeGoogleOrderedRoute(allPoints, contextText);
+
+    return res.json({
+      provider: "google_routes",
+      start: routePointResponse(normalizedStart),
+      end: routePointResponse(normalizedEnd),
+      stops: stops.map(routePointResponse),
+      legs: computed.legs,
+      totalDistanceMeters: computed.totalDistanceMeters,
+      totalDurationSeconds: computed.totalDurationSeconds,
+      segmentCount: computed.segmentCount
+    });
+  } catch (err) {
+    logBackendError(req, "route_compute_failed", err);
+    return res.status(502).json({ error: "Route calculation is temporarily unavailable." });
+  }
+});
+
+// --------------------------------------------------
+// TRIP LIVE IMAGE — RUNWARE
+// Expects: { modeKey, destination, dates?, tripGoal?, result }
+// Returns one base64 JPEG. Text generation is already complete before Android calls this.
+// --------------------------------------------------
 app.post(
   "/trip_image",
   phase3NetworkGate,
@@ -1467,6 +1799,13 @@ app.post(
   }
 );
 
+// --------------------------------------------------
+// RECIPE REMIX + SUPPORTED NORMAL-MODE LIVE IMAGES — RUNWARE FLUX.2 [klein] 4B
+// Recipe Remix expects: { baseDish?, cuisine?, remixType?, result }
+// Supported normal modes expect: { modeKey, requestedTitles, result }
+// Returns title-matched base64 JPEG images without changing /generate output.
+// This route never calls another LLM.
+// --------------------------------------------------
 app.post(
   "/recipe_remix_images",
   phase3NetworkGate,
@@ -1477,7 +1816,9 @@ app.post(
   async (req, res) => {
     try {
       const validationError = validateRecipeRemixImagesBody(req.body || {});
-      if (validationError) return respondPhase3ValidationError(res, validationError);
+      if (validationError) {
+        return respondPhase3ValidationError(res, validationError);
+      }
 
       if (!RUNWARE_API_KEY) {
         logMonitoringEvent(req, "provider_config_missing", { provider: "runware" });
@@ -1494,13 +1835,18 @@ app.post(
       const remixType = safeString(req.body.remixType).trim();
       const result = safeString(req.body.result);
       const requestedTitles = Array.isArray(req.body.requestedTitles)
-        ? req.body.requestedTitles.map((title) => safeString(title).trim()).filter(Boolean).slice(0, 4)
+        ? req.body.requestedTitles
+            .map((title) => safeString(title).trim())
+            .filter(Boolean)
+            .slice(0, 4)
         : [];
 
       const recipeSections = isRecipeRemix
         ? extractRecipeRemixImageSections(result).slice(0, 3)
         : [];
 
+      // Recipe Remix keeps its existing format-driven parser. Normal visual modes
+      // provide their already-parsed visible titles from Android instead.
       if (isRecipeRemix && recipeSections.length === 0) {
         logMonitoringEvent(req, "recipe_remix_images_skipped", {
           reason: "named_sections_not_found"
@@ -1515,7 +1861,10 @@ app.post(
         });
       }
 
-      const requestedCount = isRecipeRemix ? recipeSections.length : requestedTitles.length;
+      const requestedCount = isRecipeRemix
+        ? recipeSections.length
+        : requestedTitles.length;
+
       const startedAt = Date.now();
       logMonitoringEvent(req, "recipe_remix_images_started", {
         provider: "runware",
@@ -1582,12 +1931,15 @@ app.post(
       });
       return res.status(502).json({
         error: true,
-        message: "Result images are temporarily unavailable."
+        message: "Recipe Remix images are temporarily unavailable."
       });
     }
   }
 );
 
+// --------------------------------------------------
+// MINI-BRAIN GENERATE ENDPOINT (MAIN ENDPOINT)
+// --------------------------------------------------
 app.post(
   "/generate",
   phase3NetworkGate,
@@ -1596,28 +1948,38 @@ app.post(
   phase3UserGate,
   ...phase3GenerateLimits,
   async (req, res) => {
-    try {
-      const validationError = validateSimplePromptBody(req.body, 48000);
-      if (validationError) return respondPhase3ValidationError(res, validationError);
-
-      const prompt = req.body.prompt;
-      const completion = await client.chat.completions.create({
-        model: "gpt-4.1-mini",
-        messages: [
-          { role: "system", content: "You are Hello AI's smart assistant engine." },
-          { role: "user", content: prompt }
-        ]
-      });
-
-      const output = completion.choices?.[0]?.message?.content || "";
-      return res.json({ result: output });
-    } catch (err) {
-      logBackendError(req, "generate_failed", err);
-      return res.status(500).json({ error: "Generation is temporarily unavailable." });
+  try {
+    const validationError = validateSimplePromptBody(
+      req.body,
+      48000
+    );
+    if (validationError) {
+      return respondPhase3ValidationError(res, validationError);
     }
-  }
-);
 
+    const prompt = req.body.prompt;
+
+    const completion = await client.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: "You are Hello AI's smart assistant engine." },
+        { role: "user", content: prompt }
+      ]
+    });
+
+    const output = completion.choices?.[0]?.message?.content || "";
+    return res.json({ result: output });
+  } catch (err) {
+    logBackendError(req, "generate_failed", err);
+    return res.status(500).json({ error: "Generation is temporarily unavailable." });
+  }
+});
+
+// --------------------------------------------------
+// AGENT SMITH ENDPOINT (NEW)
+// Expects: { prompt: string }
+// Returns: strict JSON matching AgentSmithScreen parser
+// --------------------------------------------------
 app.post(
   "/agent_smith",
   phase3NetworkGate,
@@ -1626,89 +1988,101 @@ app.post(
   phase3UserGate,
   ...phase3AgentSmithLimits,
   async (req, res) => {
-    try {
-      const validationError = validateSimplePromptBody(req.body, 36000);
-      if (validationError) return respondPhase3ValidationError(res, validationError);
-
-      const prompt = req.body.prompt;
-      const completion = await client.chat.completions.create({
-        model: "gpt-4.1-mini",
-        temperature: 0.2,
-        messages: [
-          { role: "system", content: "Return ONLY valid JSON. No markdown. No extra text." },
-          { role: "user", content: prompt }
-        ]
-      });
-
-      const raw = completion.choices?.[0]?.message?.content || "";
-      let parsed;
-      try {
-        parsed = JSON.parse(raw);
-      } catch (e) {
-        parsed = {
-          answer: [raw || "Model returned empty output."],
-          evidence: [],
-          assumptionsAndUnknowns: ["Model did not return valid JSON."],
-          warnings: ["Schema violation: non-JSON response."],
-          confidence: 40,
-          stoplight: "YELLOW",
-          violationTags: ["SchemaViolation"],
-          attemptsUsed: 1
-        };
-      }
-
-      if (!Array.isArray(parsed.answer)) parsed.answer = [String(parsed.answer || "No answer.")];
-      if (!Array.isArray(parsed.evidence)) parsed.evidence = [];
-      if (!Array.isArray(parsed.assumptionsAndUnknowns)) parsed.assumptionsAndUnknowns = [];
-      if (!Array.isArray(parsed.warnings)) parsed.warnings = [];
-      if (typeof parsed.confidence !== "number") parsed.confidence = 60;
-      if (!parsed.stoplight) parsed.stoplight = "YELLOW";
-      if (!Array.isArray(parsed.violationTags)) parsed.violationTags = [];
-      if (typeof parsed.attemptsUsed !== "number") parsed.attemptsUsed = 1;
-
-      parsed.evidence = (parsed.evidence || [])
-        .filter(Boolean)
-        .map((ev) => {
-          const title = typeof ev.title === "string" ? ev.title.trim() : "";
-          const source = typeof ev.source === "string" ? ev.source.trim() : "";
-          const date = typeof ev.date === "string" ? ev.date.trim() : "";
-          const url = typeof ev.url === "string" ? ev.url.trim() : "";
-          const snippet =
-            typeof ev.snippet === "string" && ev.snippet.trim().length
-              ? ev.snippet.trim()
-              : undefined;
-          const credibilityScoreRaw = ev.credibilityScore;
-          const credibilityScore =
-            typeof credibilityScoreRaw === "number" && Number.isFinite(credibilityScoreRaw)
-              ? Math.max(0, Math.min(100, Math.round(credibilityScoreRaw)))
-              : undefined;
-
-          const out = {
-            title,
-            source: source || undefined,
-            date: date || undefined,
-            url: url || undefined
-          };
-          if (snippet !== undefined) out.snippet = snippet;
-          if (credibilityScore !== undefined) out.credibilityScore = credibilityScore;
-          return out;
-        })
-        .filter((ev) => ev.title && ev.title.length);
-
-      const s = String(parsed.stoplight).toUpperCase();
-      parsed.stoplight = s === "GREEN" || s === "RED" ? s : "YELLOW";
-
-      return res.json(parsed);
-    } catch (err) {
-      logBackendError(req, "agent_smith_failed", err);
-      return res.status(500).json({
-        error: true,
-        message: "Agent Smith is temporarily unavailable."
-      });
+  try {
+    const validationError = validateSimplePromptBody(
+      req.body,
+      36000
+    );
+    if (validationError) {
+      return respondPhase3ValidationError(res, validationError);
     }
-  }
-);
 
+    const prompt = req.body.prompt;
+
+    const completion = await client.chat.completions.create({
+      model: "gpt-4.1-mini",
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: "Return ONLY valid JSON. No markdown. No extra text." },
+        { role: "user", content: prompt }
+      ]
+    });
+
+    const raw = completion.choices?.[0]?.message?.content || "";
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      parsed = {
+        answer: [raw || "Model returned empty output."],
+        evidence: [],
+        assumptionsAndUnknowns: ["Model did not return valid JSON."],
+        warnings: ["Schema violation: non-JSON response."],
+        confidence: 40,
+        stoplight: "YELLOW",
+        violationTags: ["SchemaViolation"],
+        attemptsUsed: 1
+      };
+    }
+
+    if (!Array.isArray(parsed.answer)) parsed.answer = [String(parsed.answer || "No answer.")];
+    if (!Array.isArray(parsed.evidence)) parsed.evidence = [];
+    if (!Array.isArray(parsed.assumptionsAndUnknowns)) parsed.assumptionsAndUnknowns = [];
+    if (!Array.isArray(parsed.warnings)) parsed.warnings = [];
+    if (typeof parsed.confidence !== "number") parsed.confidence = 60;
+    if (!parsed.stoplight) parsed.stoplight = "YELLOW";
+    if (!Array.isArray(parsed.violationTags)) parsed.violationTags = [];
+    if (typeof parsed.attemptsUsed !== "number") parsed.attemptsUsed = 1;
+
+    parsed.evidence = (parsed.evidence || [])
+      .filter(Boolean)
+      .map((ev) => {
+        const title = typeof ev.title === "string" ? ev.title.trim() : "";
+        const source = typeof ev.source === "string" ? ev.source.trim() : "";
+        const date = typeof ev.date === "string" ? ev.date.trim() : "";
+        const url = typeof ev.url === "string" ? ev.url.trim() : "";
+
+        const snippet =
+          typeof ev.snippet === "string" && ev.snippet.trim().length ? ev.snippet.trim() : undefined;
+
+        const credibilityScoreRaw = ev.credibilityScore;
+        const credibilityScore =
+          typeof credibilityScoreRaw === "number" && Number.isFinite(credibilityScoreRaw)
+            ? Math.max(0, Math.min(100, Math.round(credibilityScoreRaw)))
+            : undefined;
+
+        const out = {
+          title,
+          source: source || undefined,
+          date: date || undefined,
+          url: url || undefined
+        };
+
+        if (snippet !== undefined) out.snippet = snippet;
+        if (credibilityScore !== undefined) out.credibilityScore = credibilityScore;
+
+        return out;
+      })
+      .filter((ev) => ev.title && ev.title.length);
+
+    const s = String(parsed.stoplight).toUpperCase();
+    parsed.stoplight = s === "GREEN" || s === "RED" ? s : "YELLOW";
+
+    return res.json(parsed);
+  } catch (err) {
+    logBackendError(req, "agent_smith_failed", err);
+    return res.status(500).json({
+      error: true,
+      message: "Agent Smith is temporarily unavailable."
+    });
+  }
+});
+
+// --------------------------------------------------
+// EVIDENCE SEARCH ENDPOINT (SerpApi DuckDuckGo)
+// Expects: { query: string }
+// Returns: { results: EvidenceItem[] }
+// --------------------------------------------------
 app.post(
   "/evidence_search",
   phase3NetworkGate,
@@ -1717,97 +2091,115 @@ app.post(
   phase3UserGate,
   ...phase3EvidenceSearchLimits,
   async (req, res) => {
-    try {
-      const bodyShapeError = validateAllowedKeys(req.body, ["query"]);
-      if (bodyShapeError) return respondPhase3ValidationError(res, bodyShapeError);
+  try {
+    const bodyShapeError = validateAllowedKeys(
+      req.body,
+      ["query"]
+    );
+    if (bodyShapeError) {
+      return respondPhase3ValidationError(res, bodyShapeError);
+    }
 
-      const queryError = validateStringValue(req.body.query, {
-        fieldName: "query",
-        required: true,
-        minLength: 2,
-        maxLength: 600
-      });
-      if (queryError) return respondPhase3ValidationError(res, queryError);
+    const queryError = validateStringValue(req.body.query, {
+      fieldName: "query",
+      required: true,
+      minLength: 2,
+      maxLength: 600
+    });
+    if (queryError) {
+      return respondPhase3ValidationError(res, queryError);
+    }
 
-      const q = req.body.query.trim();
-      if (!SERPAPI_API_KEY) {
-        logBackendError(
-          req,
-          "evidence_search_config_missing",
-          { name: "ConfigurationError", code: "SERVICE_NOT_CONFIGURED" }
-        );
-        return res.status(503).json({
-          error: true,
-          message: "Evidence search is temporarily unavailable.",
-          results: []
-        });
-      }
-
-      const url = new URL("https://serpapi.com/search.json");
-      url.searchParams.set("engine", "duckduckgo");
-      url.searchParams.set("q", q);
-      url.searchParams.set("api_key", SERPAPI_API_KEY);
-      url.searchParams.set("no_cache", "true");
-
-      const resp = await fetch(url, { method: "GET" });
-      if (!resp.ok) {
-        logBackendError(
-          req,
-          "evidence_search_upstream_failed",
-          { name: "UpstreamError", status: resp.status }
-        );
-        return res.status(502).json({
-          error: true,
-          message: "Evidence search is temporarily unavailable.",
-          results: []
-        });
-      }
-
-      const data = await resp.json();
-      const organic = Array.isArray(data.organic_results) ? data.organic_results : [];
-      let results = organic.slice(0, 3).map((item) => {
-        const title = safeString(item.title);
-        const link = safeString(item.link || item.url);
-        const snippet = safeString(item.snippet);
-        const domain = extractDomain(link);
-        const source = domain || null;
-        const favicon = safeString(item.favicon || item.favicon_url || item.faviconUrl);
-
-        return {
-          title: title || link || "Untitled",
-          source,
-          date: null,
-          url: link || null,
-          snippet: snippet || "No snippet available.",
-          credibilityScore: credibilityScoreFor(link, source),
-          favicon: favicon || null
-        };
-      });
-
-      if (!results.length) {
-        results.push({
-          title: `View DuckDuckGo results for: ${q}`,
-          source: "duckduckgo.com",
-          date: null,
-          url: `https://duckduckgo.com/?q=${encodeURIComponent(q)}`,
-          snippet: "Open the full DuckDuckGo results page for this question in your browser.",
-          credibilityScore: 78,
-          favicon: null
-        });
-      }
-
-      return res.json({ results });
-    } catch (err) {
-      logBackendError(req, "evidence_search_failed", err);
-      return res.status(500).json({
+    const q = req.body.query.trim();
+    if (!SERPAPI_API_KEY) {
+      logBackendError(
+        req,
+        "evidence_search_config_missing",
+        { name: "ConfigurationError", code: "SERVICE_NOT_CONFIGURED" }
+      );
+      return res.status(503).json({
         error: true,
         message: "Evidence search is temporarily unavailable.",
         results: []
       });
     }
-  }
-);
 
+    const url = new URL("https://serpapi.com/search.json");
+    url.searchParams.set("engine", "duckduckgo");
+    url.searchParams.set("q", q);
+    url.searchParams.set("api_key", SERPAPI_API_KEY);
+    url.searchParams.set("no_cache", "true"); // helpful during dev
+
+    const resp = await fetch(url, { method: "GET" });
+
+    if (!resp.ok) {
+      logBackendError(
+        req,
+        "evidence_search_upstream_failed",
+        {
+          name: "UpstreamError",
+          status: resp.status
+        }
+      );
+      return res.status(502).json({
+        error: true,
+        message: "Evidence search is temporarily unavailable.",
+        results: []
+      });
+    }
+
+    const data = await resp.json();
+
+    const organic = Array.isArray(data.organic_results) ? data.organic_results : [];
+    let results = organic.slice(0, 3).map((item) => {
+      const title = safeString(item.title);
+      const link = safeString(item.link || item.url); // some engines vary
+      const snippet = safeString(item.snippet);
+
+      const domain = extractDomain(link);
+      const source = domain || null;
+
+      // ✅ Step 1: Pass through favicon when SerpApi provides it
+      const favicon = safeString(item.favicon || item.favicon_url || item.faviconUrl);
+
+      return {
+        title: title || link || "Untitled",
+        source,
+        date: null,
+        url: link || null,
+        snippet: snippet || "No snippet available.",
+        credibilityScore: credibilityScoreFor(link, source),
+        favicon: favicon || null
+      };
+    });
+
+    // If empty, at least return a direct DDG search link
+    if (!results.length) {
+      results.push({
+        title: `View DuckDuckGo results for: ${q}`,
+        source: "duckduckgo.com",
+        date: null,
+        url: `https://duckduckgo.com/?q=${encodeURIComponent(q)}`,
+        snippet: "Open the full DuckDuckGo results page for this question in your browser.",
+        credibilityScore: 78,
+        favicon: null
+      });
+    }
+
+    return res.json({ results });
+  } catch (err) {
+    logBackendError(req, "evidence_search_failed", err);
+    return res.status(500).json({
+      error: true,
+      message: "Evidence search is temporarily unavailable.",
+      results: []
+    });
+  }
+});
+
+// --------------------------------------------------
+// PHASE 4 — FINAL PUBLIC ERROR BOUNDARY
+// --------------------------------------------------
 app.use((req, res) => {
   return res.status(404).json({
     error: true,
@@ -1816,7 +2208,10 @@ app.use((req, res) => {
 });
 
 app.use((err, req, res, next) => {
-  if (res.headersSent) return next(err);
+  if (res.headersSent) {
+    return next(err);
+  }
+
   logBackendError(req, "unhandled_backend_error", err);
   return res.status(500).json({
     error: true,
@@ -1824,6 +2219,9 @@ app.use((err, req, res, next) => {
   });
 });
 
+// --------------------------------------------------
+// START SERVER
+// --------------------------------------------------
 app.listen(PORT, () => {
   console.log(`✅ HelloAI server listening on port ${PORT}`);
   console.log(JSON.stringify({
