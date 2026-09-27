@@ -1,3 +1,5 @@
+// LinkLyfe Explore generated post images v19.
+// Adds an isolated authenticated /explore_image Runware endpoint; existing image routes and /generate remain unchanged.
 // LinkLyfe Fitness visual results Runware generalization v18.
 // Extends the existing authenticated /recipe_remix_images endpoint to supported normal-mode visual results.
 // Recipe Remix behavior remains unchanged; fitness/quick and fitness/meals use explicit requestedTitles.
@@ -574,6 +576,15 @@ const phase3TripImageLimits = phase3UserEndpointLimits(
   6,
   24
 );
+
+// Explore post images are user-triggered and limited separately from result imagery.
+// Android exposes one initial generation plus one regenerate per composer draft;
+// this server cap also prevents the route from becoming an unbounded image proxy.
+const phase3ExploreImageLimits = phase3UserEndpointLimits(
+  "explore-image",
+  4,
+  12
+);
 const phase3AgentSmithLimits = phase3UserEndpointLimits(
   "agent-smith",
   4,
@@ -655,6 +666,18 @@ function validateSimplePromptBody(body, maxLength) {
     required: true,
     minLength: 1,
     maxLength
+  });
+}
+
+function validateExploreImageBody(body) {
+  const shapeError = validateAllowedKeys(body, ["description"]);
+  if (shapeError) return shapeError;
+
+  return validateStringValue(body.description, {
+    fieldName: "description",
+    required: true,
+    minLength: 3,
+    maxLength: 500
   });
 }
 
@@ -1474,6 +1497,49 @@ async function generateSharedResultImagesWithRunware({
 }
 
 // --------------------------------------------------
+// EXPLORE POST IMAGE HELPERS (RUNWARE)
+// --------------------------------------------------
+
+function buildExplorePostRunwarePrompt(description) {
+  const cleanedDescription = cleanRecipeRemixImageText(description, 500);
+  return [
+    "Create one polished image for a modern social app post.",
+    `User image idea: ${cleanedDescription}.`,
+    "Follow the user's requested subject and setting while keeping the result suitable for a general-audience community feed.",
+    "Use one coherent scene and one camera viewpoint. Make the main subject clear, visually appealing, and realistic unless the description clearly asks for an illustration-like concept.",
+    "No collage, split screen, multiple panels, phone UI, app UI, infographic, poster, text, captions, labels, logos, or watermark."
+  ].join("\n");
+}
+
+async function generateExplorePostImageWithRunware(description) {
+  const taskUUID = randomUUID();
+  const task = {
+    taskType: "imageInference",
+    taskUUID,
+    model: RUNWARE_RECIPE_REMIX_MODEL,
+    positivePrompt: buildExplorePostRunwarePrompt(description),
+    width: 1024,
+    height: 1024
+  };
+
+  const data = await fetchRunwareRecipeRemixBatch([task]);
+  const item = data.find((candidate) => safeString(candidate?.taskUUID).trim() === taskUUID) || data[0];
+  const imageURL = safeString(item?.imageURL).trim();
+  if (!imageURL) return null;
+
+  const imageBase64 = await fetchRunwareImageAsBase64(imageURL).catch(() => "");
+  if (!imageBase64) return null;
+
+  const cost = Number(item?.cost);
+  return {
+    imageBase64,
+    mimeType: "image/jpeg",
+    imageUUID: safeString(item?.imageUUID).trim() || undefined,
+    costUsd: Number.isFinite(cost) && cost >= 0 ? cost : undefined
+  };
+}
+
+// --------------------------------------------------
 // TRIP LIVE IMAGE HELPERS (RUNWARE)
 // --------------------------------------------------
 
@@ -1717,6 +1783,89 @@ app.post(
     return res.status(502).json({ error: "Route calculation is temporarily unavailable." });
   }
 });
+
+// --------------------------------------------------
+// EXPLORE POST IMAGE — RUNWARE
+// Expects: { description }
+// Returns one transient base64 JPEG for composer preview. Persistence is Android-owned
+// only after the user publishes, so abandoned previews never create cloud media.
+// --------------------------------------------------
+app.post(
+  "/explore_image",
+  phase3NetworkGate,
+  requireFirebaseIdToken,
+  verifyLinklyfeAppCheck,
+  phase3UserGate,
+  ...phase3ExploreImageLimits,
+  async (req, res) => {
+    try {
+      const validationError = validateExploreImageBody(req.body || {});
+      if (validationError) return respondPhase3ValidationError(res, validationError);
+
+      // Explore publishing is a signed-in feature. Do not let disposable anonymous
+      // Firebase sessions become a low-cost image-generation proxy.
+      if (req.linklyfeAuth?.isAnonymous) {
+        logMonitoringEvent(req, "explore_image_rejected", { reason: "anonymous_session" });
+        return res.status(403).json({
+          error: true,
+          message: "Sign in to generate Explore post images."
+        });
+      }
+
+      if (!RUNWARE_API_KEY) {
+        logMonitoringEvent(req, "provider_config_missing", { provider: "runware" });
+        return res.status(503).json({
+          error: true,
+          message: "Explore images are temporarily unavailable."
+        });
+      }
+
+      const description = safeString(req.body.description).trim();
+      const startedAt = Date.now();
+      logMonitoringEvent(req, "explore_image_started", {
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        timeoutMs: 20000
+      });
+
+      const image = await generateExplorePostImageWithRunware(description);
+      const generationMs = Date.now() - startedAt;
+
+      if (!image) {
+        logMonitoringEvent(req, "explore_image_empty", {});
+        return res.status(502).json({
+          error: true,
+          message: "Explore images are temporarily unavailable."
+        });
+      }
+
+      logMonitoringEvent(req, "explore_image_completed", {
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        generationMs
+      });
+
+      return res.json({
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        ...image,
+        generationMs
+      });
+    } catch (err) {
+      logBackendError(req, "explore_image_failed", err, {
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        timedOut: err?.name === "AbortError",
+        runwareCode: safeString(err?.runwareCode).slice(0, 100) || undefined,
+        runwareParameter: safeString(err?.runwareParameter).slice(0, 120) || undefined
+      });
+      return res.status(502).json({
+        error: true,
+        message: "Explore images are temporarily unavailable."
+      });
+    }
+  }
+);
 
 // --------------------------------------------------
 // TRIP LIVE IMAGE — RUNWARE
