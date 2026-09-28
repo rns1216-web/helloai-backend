@@ -1,3 +1,5 @@
+// Custom Flow one-result image generation v2.
+// Adds isolated /custom_flow_image Runware generation; existing Explore, Trip, Recipe/Fitness image routes and /generate remain unchanged.
 // LinkLyfe Explore generated post images v19.
 // Adds an isolated authenticated /explore_image Runware endpoint; existing image routes and /generate remain unchanged.
 // LinkLyfe Fitness visual results Runware generalization v18.
@@ -585,6 +587,14 @@ const phase3ExploreImageLimits = phase3UserEndpointLimits(
   4,
   12
 );
+
+// Custom Flow image generation is one image per clarified flow. Keep its own counter so
+// image creation cannot consume or bypass Explore/result-image quotas.
+const phase3CustomFlowImageLimits = phase3UserEndpointLimits(
+  "custom-flow-image",
+  3,
+  10
+);
 const phase3AgentSmithLimits = phase3UserEndpointLimits(
   "agent-smith",
   4,
@@ -678,6 +688,18 @@ function validateExploreImageBody(body) {
     required: true,
     minLength: 3,
     maxLength: 500
+  });
+}
+
+function validateCustomFlowImageBody(body) {
+  const shapeError = validateAllowedKeys(body, ["description"]);
+  if (shapeError) return shapeError;
+
+  return validateStringValue(body.description, {
+    fieldName: "description",
+    required: true,
+    minLength: 3,
+    maxLength: 1200
   });
 }
 
@@ -1539,6 +1561,50 @@ async function generateExplorePostImageWithRunware(description) {
   };
 }
 
+
+// --------------------------------------------------
+// CUSTOM FLOW IMAGE HELPERS (RUNWARE)
+// --------------------------------------------------
+
+function buildCustomFlowRunwarePrompt(description) {
+  const cleanedDescription = cleanRecipeRemixImageText(description, 1200);
+  return [
+    "Create one polished standalone image that directly follows the user's clarified request.",
+    `User request and follow-up details: ${cleanedDescription}.`,
+    "Preserve the requested subject, visual style, setting, composition, mood, colors, and important details when they are provided.",
+    "Use one coherent final image rather than a collage or multiple alternatives unless the user explicitly requested a multi-panel composition.",
+    "Do not add a watermark. Do not invent brand names, claims, or readable text that the user did not request."
+  ].join("\n");
+}
+
+async function generateCustomFlowImageWithRunware(description) {
+  const taskUUID = randomUUID();
+  const task = {
+    taskType: "imageInference",
+    taskUUID,
+    model: RUNWARE_RECIPE_REMIX_MODEL,
+    positivePrompt: buildCustomFlowRunwarePrompt(description),
+    width: 1024,
+    height: 1024
+  };
+
+  const data = await fetchRunwareRecipeRemixBatch([task]);
+  const item = data.find((candidate) => safeString(candidate?.taskUUID).trim() === taskUUID) || data[0];
+  const imageURL = safeString(item?.imageURL).trim();
+  if (!imageURL) return null;
+
+  const imageBase64 = await fetchRunwareImageAsBase64(imageURL).catch(() => "");
+  if (!imageBase64) return null;
+
+  const cost = Number(item?.cost);
+  return {
+    imageBase64,
+    mimeType: "image/jpeg",
+    imageUUID: safeString(item?.imageUUID).trim() || undefined,
+    costUsd: Number.isFinite(cost) && cost >= 0 ? cost : undefined
+  };
+}
+
 // --------------------------------------------------
 // TRIP LIVE IMAGE HELPERS (RUNWARE)
 // --------------------------------------------------
@@ -1862,6 +1928,80 @@ app.post(
       return res.status(502).json({
         error: true,
         message: "Explore images are temporarily unavailable."
+      });
+    }
+  }
+);
+
+
+// --------------------------------------------------
+// CUSTOM FLOW IMAGE — RUNWARE
+// Expects: { description }
+// Returns one transient base64 JPEG. Custom Flow follow-up questions happen before
+// this call; the image itself is the final result and has no Custom Flow More menu.
+// --------------------------------------------------
+app.post(
+  "/custom_flow_image",
+  phase3NetworkGate,
+  requireFirebaseIdToken,
+  verifyLinklyfeAppCheck,
+  phase3UserGate,
+  ...phase3CustomFlowImageLimits,
+  async (req, res) => {
+    try {
+      const validationError = validateCustomFlowImageBody(req.body || {});
+      if (validationError) return respondPhase3ValidationError(res, validationError);
+
+      if (!RUNWARE_API_KEY) {
+        logMonitoringEvent(req, "provider_config_missing", { provider: "runware" });
+        return res.status(503).json({
+          error: true,
+          message: "Custom Flow images are temporarily unavailable."
+        });
+      }
+
+      const description = safeString(req.body.description).trim();
+      const startedAt = Date.now();
+      logMonitoringEvent(req, "custom_flow_image_started", {
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        timeoutMs: 20000
+      });
+
+      const image = await generateCustomFlowImageWithRunware(description);
+      const generationMs = Date.now() - startedAt;
+
+      if (!image) {
+        logMonitoringEvent(req, "custom_flow_image_empty", {});
+        return res.status(502).json({
+          error: true,
+          message: "Custom Flow images are temporarily unavailable."
+        });
+      }
+
+      logMonitoringEvent(req, "custom_flow_image_completed", {
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        generationMs
+      });
+
+      return res.json({
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        ...image,
+        generationMs
+      });
+    } catch (err) {
+      logBackendError(req, "custom_flow_image_failed", err, {
+        provider: "runware",
+        model: RUNWARE_RECIPE_REMIX_MODEL,
+        timedOut: err?.name === "AbortError",
+        runwareCode: safeString(err?.runwareCode).slice(0, 100) || undefined,
+        runwareParameter: safeString(err?.runwareParameter).slice(0, 120) || undefined
+      });
+      return res.status(502).json({
+        error: true,
+        message: "Custom Flow images are temporarily unavailable."
       });
     }
   }
