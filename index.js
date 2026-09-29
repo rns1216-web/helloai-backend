@@ -115,6 +115,8 @@ const RUNWARE_API_URL = "https://api.runware.ai/v1";
 const RUNWARE_RECIPE_REMIX_MODEL =
   String(process.env.RUNWARE_RECIPE_REMIX_MODEL || "runware:400@4").trim() ||
   "runware:400@4";
+const RUNWARE_IMAGE_GENERATION_TIMEOUT_MS = 45_000;
+const RUNWARE_IMAGE_DOWNLOAD_TIMEOUT_MS = 20_000;
 
 // Phase 5 App Check rollout:
 // - monitor (default): verify/log tokens but never block an otherwise authenticated request.
@@ -1341,7 +1343,7 @@ function buildSharedResultRunwarePrompt({ modeKey, title }) {
 
 async function fetchRunwareRecipeRemixBatch(tasks) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20_000);
+  const timeout = setTimeout(() => controller.abort(), RUNWARE_IMAGE_GENERATION_TIMEOUT_MS);
   timeout.unref?.();
 
   try {
@@ -1390,7 +1392,7 @@ async function fetchRunwareImageAsBase64(imageURL) {
   if (!cleanedURL) return "";
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12_000);
+  const timeout = setTimeout(() => controller.abort(), RUNWARE_IMAGE_DOWNLOAD_TIMEOUT_MS);
   timeout.unref?.();
 
   try {
@@ -1891,7 +1893,8 @@ app.post(
       logMonitoringEvent(req, "explore_image_started", {
         provider: "runware",
         model: RUNWARE_RECIPE_REMIX_MODEL,
-        timeoutMs: 20000
+        timeoutMs: RUNWARE_IMAGE_GENERATION_TIMEOUT_MS,
+        imageDownloadTimeoutMs: RUNWARE_IMAGE_DOWNLOAD_TIMEOUT_MS
       });
 
       const image = await generateExplorePostImageWithRunware(description);
@@ -1965,7 +1968,8 @@ app.post(
       logMonitoringEvent(req, "custom_flow_image_started", {
         provider: "runware",
         model: RUNWARE_RECIPE_REMIX_MODEL,
-        timeoutMs: 20000
+        timeoutMs: RUNWARE_IMAGE_GENERATION_TIMEOUT_MS,
+        imageDownloadTimeoutMs: RUNWARE_IMAGE_DOWNLOAD_TIMEOUT_MS
       });
 
       const image = await generateCustomFlowImageWithRunware(description);
@@ -2045,7 +2049,8 @@ app.post(
         provider: "runware",
         model: RUNWARE_RECIPE_REMIX_MODEL,
         modeKey: input.modeKey,
-        timeoutMs: 20000
+        timeoutMs: RUNWARE_IMAGE_GENERATION_TIMEOUT_MS,
+        imageDownloadTimeoutMs: RUNWARE_IMAGE_DOWNLOAD_TIMEOUT_MS
       });
 
       const image = await generateTripImageWithRunware(input);
@@ -2160,7 +2165,8 @@ app.post(
         model: RUNWARE_RECIPE_REMIX_MODEL,
         modeKey: modeKey || "recipe/twist",
         requested: requestedCount,
-        timeoutMs: 20000
+        timeoutMs: RUNWARE_IMAGE_GENERATION_TIMEOUT_MS,
+        imageDownloadTimeoutMs: RUNWARE_IMAGE_DOWNLOAD_TIMEOUT_MS
       });
 
       const images = isRecipeRemix
