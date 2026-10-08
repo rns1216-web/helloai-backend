@@ -1,3 +1,6 @@
+// LinkLyfe production subscription identity hardening v20.
+// Adds server-authoritative Google Play subscription verification bound to signed-in Firebase accounts.
+// Uses existing Firebase/Admin/App Check/security middleware conventions; no separate subscription route file required.
 // Custom Flow one-result image generation v2.
 // Adds isolated /custom_flow_image Runware generation; existing Explore, Trip, Recipe/Fitness image routes and /generate remain unchanged.
 // LinkLyfe Explore generated post images v19.
@@ -52,7 +55,10 @@ const { OpenAI } = require("openai");
 const { initializeApp, applicationDefault, cert, getApps } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const { getAppCheck } = require("firebase-admin/app-check");
-const { randomUUID } = require("crypto");
+const crypto = require("crypto");
+const { randomUUID } = crypto;
+const fs = require("fs");
+const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
 // Load .env variables
 dotenv.config();
@@ -128,6 +134,46 @@ const APP_CHECK_ENFORCEMENT_MODE =
     .toLowerCase() === "enforce"
     ? "enforce"
     : "monitor";
+
+
+// --------------------------------------------------
+// PRODUCTION SUBSCRIPTION IDENTITY HARDENING
+// --------------------------------------------------
+// Subscription verification is stricter than ordinary generation traffic:
+// - a non-anonymous Firebase account is required;
+// - the purchase token is verified server-side with Google Play;
+// - the token is bound to one Firebase UID in server-owned Firestore records;
+// - App Check is required by default for billing endpoints even while the rest
+//   of the app remains in monitor mode during rollout.
+const LINKLYFE_SUBSCRIPTION_PACKAGE_NAME =
+  String(process.env.GOOGLE_PLAY_PACKAGE_NAME || "com.linklyfe.app").trim();
+const LINKLYFE_SUBSCRIPTION_PRODUCT_ID =
+  String(process.env.LINKLYFE_SUBSCRIPTION_PRODUCT_ID || "linklyfe_unlimited").trim();
+const LINKLYFE_SUBSCRIPTION_ALLOWED_BASE_PLANS = new Set([
+  String(process.env.LINKLYFE_MONTHLY_BASE_PLAN_ID || "monthly").trim(),
+  String(process.env.LINKLYFE_YEARLY_BASE_PLAN_ID || "yearly").trim()
+]);
+const LINKLYFE_BILLING_REQUIRE_APP_CHECK =
+  String(process.env.LINKLYFE_BILLING_REQUIRE_APP_CHECK || "true")
+    .trim()
+    .toLowerCase() !== "false";
+const LINKLYFE_BILLING_REVERIFY_MS = Number(
+  process.env.LINKLYFE_BILLING_REVERIFY_MS || 6 * 60 * 60 * 1000
+);
+const LINKLYFE_BILLING_SERVER_GRACE_MS = Number(
+  process.env.LINKLYFE_BILLING_SERVER_GRACE_MS || 72 * 60 * 60 * 1000
+);
+const LINKLYFE_SUBSCRIPTION_ENTITLEMENT_COLLECTION =
+  "linklyfe_subscription_entitlements_v1";
+const LINKLYFE_SUBSCRIPTION_TOKEN_COLLECTION =
+  "linklyfe_subscription_purchase_tokens_v1";
+const LINKLYFE_ANDROID_PUBLISHER_SCOPE =
+  "https://www.googleapis.com/auth/androidpublisher";
+const LINKLYFE_GOOGLE_OAUTH_TOKEN_URL =
+  "https://oauth2.googleapis.com/token";
+
+let linklyfeCachedGooglePlayAccessToken = null;
+let linklyfeCachedGooglePlayAccessTokenExpiresAt = 0;
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
@@ -618,6 +664,21 @@ const phase3RouteComputeLimits = phase3UserEndpointLimits(
   20
 );
 
+
+// Billing calls are lightweight but security-sensitive. Keep dedicated counters so
+// repeated token-claim attempts cannot consume or hide inside generation quotas.
+const phase3SubscriptionVerifyLimits = phase3UserEndpointLimits(
+  "subscription-verify",
+  8,
+  24
+);
+
+const phase3SubscriptionStatusLimits = phase3UserEndpointLimits(
+  "subscription-status",
+  20,
+  80
+);
+
 function isJsonObject(value) {
   return value !== null &&
     typeof value === "object" &&
@@ -859,6 +920,562 @@ function respondPhase3ValidationError(res, message) {
   logMonitoringEvent(res?.req, "validation_rejected", { reason: safeReason });
   return res.status(400).json({
     error: true,
+    message
+  });
+}
+
+
+// --------------------------------------------------
+// SUBSCRIPTION VERIFICATION HELPERS
+// --------------------------------------------------
+class LinklyfeSubscriptionHttpError extends Error {
+  constructor(status, code, message) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+class LinklyfeSubscriptionOwnershipConflictError extends Error {
+  constructor() {
+    super("This Google Play subscription is linked to another LinkLyfe account.");
+    this.code = "purchase_owned_by_other_account";
+  }
+}
+
+function linklyfeSubscriptionSha256(value) {
+  return crypto
+    .createHash("sha256")
+    .update(String(value || ""), "utf8")
+    .digest("hex");
+}
+
+function linklyfeSubscriptionBase64Url(input) {
+  const buffer = Buffer.isBuffer(input)
+    ? input
+    : Buffer.from(String(input), "utf8");
+  return buffer
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function readLinklyfeGooglePlayServiceAccount() {
+  let raw = String(process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON || "").trim();
+
+  if (!raw && process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_BASE64) {
+    raw = Buffer.from(
+      String(process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_BASE64),
+      "base64"
+    ).toString("utf8");
+  }
+
+  if (!raw && process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_FILE) {
+    raw = fs.readFileSync(
+      String(process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_FILE),
+      "utf8"
+    );
+  }
+
+  if (!raw) {
+    throw new Error(
+      "Google Play service account credentials are not configured."
+    );
+  }
+
+  const parsed = JSON.parse(raw);
+  if (!parsed.client_email || !parsed.private_key) {
+    throw new Error(
+      "Google Play service account JSON is missing client_email/private_key."
+    );
+  }
+
+  parsed.private_key = String(parsed.private_key).replace(/\\n/g, "\n");
+  return parsed;
+}
+
+async function linklyfeAndroidPublisherAccessToken() {
+  const nowMs = Date.now();
+  if (
+    linklyfeCachedGooglePlayAccessToken &&
+    nowMs + 60_000 < linklyfeCachedGooglePlayAccessTokenExpiresAt
+  ) {
+    return linklyfeCachedGooglePlayAccessToken;
+  }
+
+  const credential = readLinklyfeGooglePlayServiceAccount();
+  const nowSeconds = Math.floor(nowMs / 1000);
+  const header = linklyfeSubscriptionBase64Url(
+    JSON.stringify({ alg: "RS256", typ: "JWT" })
+  );
+  const claims = linklyfeSubscriptionBase64Url(
+    JSON.stringify({
+      iss: credential.client_email,
+      scope: LINKLYFE_ANDROID_PUBLISHER_SCOPE,
+      aud: LINKLYFE_GOOGLE_OAUTH_TOKEN_URL,
+      iat: nowSeconds,
+      exp: nowSeconds + 3600
+    })
+  );
+  const unsignedJwt = `${header}.${claims}`;
+  const signature = crypto
+    .createSign("RSA-SHA256")
+    .update(unsignedJwt)
+    .end()
+    .sign(credential.private_key);
+  const assertion = `${unsignedJwt}.${linklyfeSubscriptionBase64Url(signature)}`;
+
+  const response = await fetch(LINKLYFE_GOOGLE_OAUTH_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion
+    })
+  });
+
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || !body.access_token) {
+    throw new LinklyfeSubscriptionHttpError(
+      response.status || 502,
+      "google_play_auth_failed",
+      body.error_description ||
+        body.error ||
+        "Could not authorize Google Play Developer API."
+    );
+  }
+
+  linklyfeCachedGooglePlayAccessToken = body.access_token;
+  linklyfeCachedGooglePlayAccessTokenExpiresAt =
+    nowMs + Number(body.expires_in || 3600) * 1000;
+  return linklyfeCachedGooglePlayAccessToken;
+}
+
+async function linklyfeGooglePlayRequest(url, options = {}) {
+  const accessToken = await linklyfeAndroidPublisherAccessToken();
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      ...(options.body
+        ? { "Content-Type": "application/json; charset=utf-8" }
+        : {}),
+      ...(options.headers || {})
+    }
+  });
+
+  const raw = await response.text();
+  let parsed = {};
+  if (raw) {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = { message: raw.slice(0, 500) };
+    }
+  }
+
+  if (!response.ok) {
+    const message =
+      parsed?.error?.message ||
+      parsed?.message ||
+      `Google Play request failed (${response.status}).`;
+    throw new LinklyfeSubscriptionHttpError(
+      response.status,
+      "google_play_request_failed",
+      message
+    );
+  }
+
+  return parsed;
+}
+
+async function linklyfeGetSubscriptionFromGooglePlay(purchaseToken) {
+  const url =
+    `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(LINKLYFE_SUBSCRIPTION_PACKAGE_NAME)}` +
+    `/purchases/subscriptionsv2/tokens/${encodeURIComponent(purchaseToken)}`;
+  return linklyfeGooglePlayRequest(url, { method: "GET" });
+}
+
+async function linklyfeAcknowledgeSubscriptionIfNeeded(
+  purchaseToken,
+  productId,
+  acknowledgementState
+) {
+  if (acknowledgementState !== "ACKNOWLEDGEMENT_STATE_PENDING") {
+    return true;
+  }
+
+  const url =
+    `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(LINKLYFE_SUBSCRIPTION_PACKAGE_NAME)}` +
+    `/purchases/subscriptions/${encodeURIComponent(productId)}` +
+    `/tokens/${encodeURIComponent(purchaseToken)}:acknowledge`;
+
+  try {
+    await linklyfeGooglePlayRequest(url, { method: "POST", body: "{}" });
+    return true;
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: "subscription_acknowledgement_failed",
+      ...safeBackendErrorMeta(error)
+    }));
+    return false;
+  }
+}
+
+function linklyfeIsGoogleInfrastructureError(error) {
+  const status = Number(error?.status || 0);
+  return (
+    status === 0 ||
+    status === 401 ||
+    status === 403 ||
+    status === 429 ||
+    status >= 500
+  );
+}
+
+function linklyfeIsTerminalPurchaseLookupError(error) {
+  const status = Number(error?.status || 0);
+  return status === 400 || status === 404 || status === 410;
+}
+
+function parseLinklyfePlaySubscription(play) {
+  const lineItems = Array.isArray(play?.lineItems) ? play.lineItems : [];
+  const matchingItems = lineItems.filter(
+    (item) => item?.productId === LINKLYFE_SUBSCRIPTION_PRODUCT_ID
+  );
+  const item = matchingItems
+    .slice()
+    .sort(
+      (a, b) =>
+        Date.parse(b?.expiryTime || 0) - Date.parse(a?.expiryTime || 0)
+    )[0];
+
+  if (!item) {
+    throw new LinklyfeSubscriptionHttpError(
+      400,
+      "wrong_product",
+      "Purchase token is not for LinkLyfe Unlimited."
+    );
+  }
+
+  const basePlanId = item?.offerDetails?.basePlanId || null;
+  if (
+    !basePlanId ||
+    !LINKLYFE_SUBSCRIPTION_ALLOWED_BASE_PLANS.has(basePlanId)
+  ) {
+    throw new LinklyfeSubscriptionHttpError(
+      400,
+      "wrong_base_plan",
+      "Purchase token is not for an active LinkLyfe base plan."
+    );
+  }
+
+  const expiryMs = Date.parse(item.expiryTime || 0);
+  const state = String(
+    play?.subscriptionState || "SUBSCRIPTION_STATE_UNSPECIFIED"
+  );
+  const accessStates = new Set([
+    "SUBSCRIPTION_STATE_ACTIVE",
+    "SUBSCRIPTION_STATE_IN_GRACE_PERIOD",
+    "SUBSCRIPTION_STATE_CANCELED"
+  ]);
+  const active =
+    accessStates.has(state) &&
+    Number.isFinite(expiryMs) &&
+    expiryMs > Date.now();
+
+  return {
+    active,
+    state,
+    productId: item.productId,
+    basePlanId,
+    expiresAt: item.expiryTime || null,
+    acknowledgementState: play?.acknowledgementState || null,
+    linkedPurchaseToken: play?.linkedPurchaseToken || null,
+    obfuscatedAccountId:
+      play?.externalAccountIdentifiers?.obfuscatedExternalAccountId || null,
+    isTestPurchase: Boolean(play?.testPurchase)
+  };
+}
+
+function linklyfeSubscriptionEntitlementActiveNow(data) {
+  if (!data?.active) return false;
+  if (data?.state === "LINKLYFE_ADMIN") return true;
+  const expiryMs = Date.parse(data?.expiresAt || 0);
+  return Number.isFinite(expiryMs) && expiryMs > Date.now();
+}
+
+function linklyfeSubscriptionResponse(data, extras = {}) {
+  return {
+    active: linklyfeSubscriptionEntitlementActiveNow(data),
+    state: data?.state || "SUBSCRIPTION_STATE_UNSPECIFIED",
+    productId: data?.productId || LINKLYFE_SUBSCRIPTION_PRODUCT_ID,
+    basePlanId: data?.basePlanId || null,
+    expiresAt: data?.expiresAt || null,
+    lastVerifiedAt: data?.lastVerifiedAt || null,
+    ...extras
+  };
+}
+
+async function requireLinklyfeSubscriptionAccount(req, res, next) {
+  const idToken = bearerTokenFromRequest(req);
+  if (!idToken) {
+    logMonitoringEvent(req, "subscription_auth_rejected", {
+      reason: "missing_token"
+    });
+    return res.status(401).json({
+      active: false,
+      code: "missing_auth",
+      message: "A signed-in LinkLyfe account is required."
+    });
+  }
+
+  try {
+    const decodedToken = await getAuth().verifyIdToken(idToken, true);
+    const provider = decodedToken?.firebase?.sign_in_provider || "unknown";
+    if (!decodedToken?.uid || provider === "anonymous") {
+      logMonitoringEvent(req, "subscription_auth_rejected", {
+        reason: "account_required"
+      });
+      return res.status(401).json({
+        active: false,
+        code: "account_required",
+        message: "A signed-in LinkLyfe account is required."
+      });
+    }
+
+    req.linklyfeAuth = {
+      uid: decodedToken.uid,
+      provider,
+      isAnonymous: false,
+      isAdmin: decodedToken.linklyfeAdmin === true
+    };
+
+    if (LINKLYFE_BILLING_REQUIRE_APP_CHECK) {
+      const appCheckToken = firebaseAppCheckTokenFromRequest(req);
+      if (!appCheckToken) {
+        req.linklyfeAppCheck = { status: "missing" };
+        logMonitoringEvent(req, "subscription_app_check_rejected", {
+          reason: "missing_token"
+        });
+        return res.status(401).json({
+          active: false,
+          code: "missing_app_check",
+          message: "App verification required."
+        });
+      }
+
+      try {
+        const decodedAppCheck = await getAppCheck().verifyToken(appCheckToken);
+        req.linklyfeAppCheck = {
+          status: "verified",
+          appId:
+            typeof decodedAppCheck?.app_id === "string"
+              ? decodedAppCheck.app_id
+              : ""
+        };
+      } catch (_) {
+        req.linklyfeAppCheck = { status: "invalid" };
+        logMonitoringEvent(req, "subscription_app_check_rejected", {
+          reason: "invalid_token"
+        });
+        return res.status(401).json({
+          active: false,
+          code: "invalid_app_check",
+          message: "App verification required."
+        });
+      }
+    } else {
+      const appCheckToken = firebaseAppCheckTokenFromRequest(req);
+      if (!appCheckToken) {
+        req.linklyfeAppCheck = { status: "missing" };
+      } else {
+        try {
+          const decodedAppCheck = await getAppCheck().verifyToken(appCheckToken);
+          req.linklyfeAppCheck = {
+            status: "verified",
+            appId:
+              typeof decodedAppCheck?.app_id === "string"
+                ? decodedAppCheck.app_id
+                : ""
+          };
+        } catch (_) {
+          req.linklyfeAppCheck = { status: "invalid" };
+        }
+      }
+    }
+
+    return next();
+  } catch (_) {
+    logMonitoringEvent(req, "subscription_auth_rejected", {
+      reason: "invalid_or_revoked_token"
+    });
+    return res.status(401).json({
+      active: false,
+      code: "invalid_auth",
+      message: "A signed-in LinkLyfe account is required."
+    });
+  }
+}
+
+async function persistLinklyfeVerifiedPurchase(
+  uid,
+  purchaseToken,
+  parsed,
+  source
+) {
+  const db = getFirestore();
+  const tokenHash = linklyfeSubscriptionSha256(purchaseToken);
+  const linkedHash = parsed.linkedPurchaseToken
+    ? linklyfeSubscriptionSha256(parsed.linkedPurchaseToken)
+    : null;
+  const expectedAccountId = linklyfeSubscriptionSha256(uid);
+
+  if (
+    parsed.obfuscatedAccountId &&
+    parsed.obfuscatedAccountId !== expectedAccountId
+  ) {
+    throw new LinklyfeSubscriptionOwnershipConflictError();
+  }
+
+  const entitlementRef = db
+    .collection(LINKLYFE_SUBSCRIPTION_ENTITLEMENT_COLLECTION)
+    .doc(uid);
+  const tokenRef = db
+    .collection(LINKLYFE_SUBSCRIPTION_TOKEN_COLLECTION)
+    .doc(tokenHash);
+  const linkedTokenRef = linkedHash
+    ? db.collection(LINKLYFE_SUBSCRIPTION_TOKEN_COLLECTION).doc(linkedHash)
+    : null;
+
+  await db.runTransaction(async (tx) => {
+    const tokenSnapshot = await tx.get(tokenRef);
+    if (tokenSnapshot.exists) {
+      const owner = String(tokenSnapshot.data()?.ownerFirebaseUid || "");
+      if (owner && owner !== uid) {
+        throw new LinklyfeSubscriptionOwnershipConflictError();
+      }
+    }
+
+    if (linkedTokenRef) {
+      const linkedSnapshot = await tx.get(linkedTokenRef);
+      if (linkedSnapshot.exists) {
+        const linkedOwner = String(
+          linkedSnapshot.data()?.ownerFirebaseUid || ""
+        );
+        if (linkedOwner && linkedOwner !== uid) {
+          throw new LinklyfeSubscriptionOwnershipConflictError();
+        }
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+    tx.set(
+      tokenRef,
+      {
+        ownerFirebaseUid: uid,
+        purchaseToken,
+        purchaseTokenHash: tokenHash,
+        linkedPurchaseTokenHash: linkedHash,
+        productId: parsed.productId,
+        basePlanId: parsed.basePlanId,
+        state: parsed.state,
+        expiresAt: parsed.expiresAt,
+        active: parsed.active,
+        obfuscatedAccountId: parsed.obfuscatedAccountId || null,
+        testPurchase: parsed.isTestPurchase,
+        lastVerifiedAt: nowIso,
+        updatedAt: FieldValue.serverTimestamp(),
+        createdAt: tokenSnapshot.exists
+          ? tokenSnapshot.data()?.createdAt || FieldValue.serverTimestamp()
+          : FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
+
+    if (linkedTokenRef) {
+      tx.set(
+        linkedTokenRef,
+        {
+          ownerFirebaseUid: uid,
+          purchaseTokenHash: linkedHash,
+          successorPurchaseTokenHash: tokenHash,
+          productId: parsed.productId,
+          updatedAt: FieldValue.serverTimestamp()
+        },
+        { merge: true }
+      );
+    }
+
+    tx.set(
+      entitlementRef,
+      {
+        ownerFirebaseUid: uid,
+        active: parsed.active,
+        productId: parsed.productId,
+        basePlanId: parsed.basePlanId,
+        state: parsed.state,
+        expiresAt: parsed.expiresAt,
+        purchaseTokenHash: tokenHash,
+        linkedPurchaseTokenHash: linkedHash,
+        testPurchase: parsed.isTestPurchase,
+        lastVerifiedAt: nowIso,
+        source,
+        updatedAt: FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
+  });
+}
+
+async function verifyAndPersistLinklyfeSubscription(
+  uid,
+  purchaseToken,
+  source
+) {
+  const play = await linklyfeGetSubscriptionFromGooglePlay(purchaseToken);
+  const parsed = parseLinklyfePlaySubscription(play);
+  await persistLinklyfeVerifiedPurchase(uid, purchaseToken, parsed, source);
+  const acknowledged = await linklyfeAcknowledgeSubscriptionIfNeeded(
+    purchaseToken,
+    parsed.productId,
+    parsed.acknowledgementState
+  );
+  return { ...parsed, acknowledged };
+}
+
+function sendLinklyfeSubscriptionError(req, res, error) {
+  if (error instanceof LinklyfeSubscriptionOwnershipConflictError) {
+    logMonitoringEvent(req, "subscription_ownership_conflict", {});
+    return res.status(409).json({
+      active: false,
+      code: error.code,
+      message: error.message
+    });
+  }
+
+  const status = Number(error?.status || 500);
+  const safeStatus = status >= 400 && status <= 599 ? status : 500;
+  const code = error?.code || "subscription_verification_failed";
+
+  if (safeStatus >= 500) {
+    logBackendError(req, "subscription_verification_failed", error);
+  } else {
+    logMonitoringEvent(req, "subscription_verification_rejected", {
+      code,
+      status: safeStatus
+    });
+  }
+
+  const message =
+    safeStatus >= 500
+      ? "Subscription verification is temporarily unavailable."
+      : error?.message || "Subscription verification failed.";
+
+  return res.status(safeStatus).json({
+    active: false,
+    code,
     message
   });
 }
@@ -2492,6 +3109,223 @@ app.post(
   }
 });
 
+
+// --------------------------------------------------
+// LINKLYFE UNLIMITED — SERVER-AUTHORITATIVE SUBSCRIPTION ROUTES
+// --------------------------------------------------
+app.post(
+  "/subscription/verify",
+  phase3NetworkGate,
+  requireLinklyfeSubscriptionAccount,
+  phase3UserGate,
+  ...phase3SubscriptionVerifyLimits,
+  async (req, res) => {
+    try {
+      const bodyShapeError = validateAllowedKeys(
+        req.body,
+        ["purchaseToken", "productId"]
+      );
+      if (bodyShapeError) {
+        throw new LinklyfeSubscriptionHttpError(
+          400,
+          "invalid_request",
+          bodyShapeError
+        );
+      }
+
+      const purchaseTokenError = validateStringValue(
+        req.body?.purchaseToken,
+        {
+          fieldName: "purchaseToken",
+          required: true,
+          minLength: 8,
+          maxLength: 4096
+        }
+      );
+      if (purchaseTokenError) {
+        throw new LinklyfeSubscriptionHttpError(
+          400,
+          "missing_purchase_token",
+          purchaseTokenError
+        );
+      }
+
+      const productIdError = validateStringValue(
+        req.body?.productId,
+        {
+          fieldName: "productId",
+          required: false,
+          maxLength: 160
+        }
+      );
+      if (productIdError) {
+        throw new LinklyfeSubscriptionHttpError(
+          400,
+          "invalid_product",
+          productIdError
+        );
+      }
+
+      const purchaseToken = String(req.body.purchaseToken).trim();
+      const requestedProductId = String(req.body?.productId || "").trim();
+      if (
+        requestedProductId &&
+        requestedProductId !== LINKLYFE_SUBSCRIPTION_PRODUCT_ID
+      ) {
+        throw new LinklyfeSubscriptionHttpError(
+          400,
+          "wrong_product",
+          "Unsupported subscription product."
+        );
+      }
+
+      const uid = req.linklyfeAuth.uid;
+      const result = await verifyAndPersistLinklyfeSubscription(
+        uid,
+        purchaseToken,
+        "android_purchase_verify"
+      );
+
+      return res.json(
+        linklyfeSubscriptionResponse(result, {
+          acknowledged: result.acknowledged
+        })
+      );
+    } catch (error) {
+      return sendLinklyfeSubscriptionError(req, res, error);
+    }
+  }
+);
+
+app.post(
+  "/subscription/status",
+  phase3NetworkGate,
+  requireLinklyfeSubscriptionAccount,
+  phase3UserGate,
+  ...phase3SubscriptionStatusLimits,
+  async (req, res) => {
+    const uid = req.linklyfeAuth.uid;
+
+    if (req.linklyfeAuth.isAdmin === true) {
+      return res.json({
+        active: true,
+        state: "LINKLYFE_ADMIN",
+        productId: LINKLYFE_SUBSCRIPTION_PRODUCT_ID,
+        basePlanId: null,
+        expiresAt: null,
+        source: "admin_claim"
+      });
+    }
+
+    const db = getFirestore();
+    const entitlementRef = db
+      .collection(LINKLYFE_SUBSCRIPTION_ENTITLEMENT_COLLECTION)
+      .doc(uid);
+
+    try {
+      const entitlementSnapshot = await entitlementRef.get();
+      if (!entitlementSnapshot.exists) {
+        return res.json({
+          active: false,
+          state: "NO_ENTITLEMENT",
+          productId: LINKLYFE_SUBSCRIPTION_PRODUCT_ID,
+          basePlanId: null,
+          expiresAt: null
+        });
+      }
+
+      const entitlement = entitlementSnapshot.data() || {};
+      const lastVerifiedMs = Date.parse(entitlement.lastVerifiedAt || 0);
+      const ageMs = Number.isFinite(lastVerifiedMs)
+        ? Date.now() - lastVerifiedMs
+        : Number.MAX_SAFE_INTEGER;
+
+      if (ageMs <= LINKLYFE_BILLING_REVERIFY_MS) {
+        return res.json(linklyfeSubscriptionResponse(entitlement));
+      }
+
+      const purchaseTokenHash = String(
+        entitlement.purchaseTokenHash || ""
+      ).trim();
+      if (!purchaseTokenHash) {
+        return res.json({
+          ...linklyfeSubscriptionResponse(entitlement),
+          active: false,
+          state: "MISSING_PURCHASE_TOKEN"
+        });
+      }
+
+      const tokenSnapshot = await db
+        .collection(LINKLYFE_SUBSCRIPTION_TOKEN_COLLECTION)
+        .doc(purchaseTokenHash)
+        .get();
+      const tokenRecord = tokenSnapshot.exists
+        ? tokenSnapshot.data() || {}
+        : {};
+      const purchaseToken = String(tokenRecord.purchaseToken || "").trim();
+      const tokenOwner = String(
+        tokenRecord.ownerFirebaseUid || ""
+      ).trim();
+
+      if (!purchaseToken || tokenOwner !== uid) {
+        return res.json({
+          ...linklyfeSubscriptionResponse(entitlement),
+          active: false,
+          state: "MISSING_PURCHASE_TOKEN"
+        });
+      }
+
+      try {
+        const refreshed = await verifyAndPersistLinklyfeSubscription(
+          uid,
+          purchaseToken,
+          "account_status_refresh"
+        );
+        return res.json(linklyfeSubscriptionResponse(refreshed));
+      } catch (error) {
+        if (error instanceof LinklyfeSubscriptionOwnershipConflictError) {
+          return sendLinklyfeSubscriptionError(req, res, error);
+        }
+
+        if (
+          linklyfeIsGoogleInfrastructureError(error) &&
+          linklyfeSubscriptionEntitlementActiveNow(entitlement) &&
+          ageMs <= LINKLYFE_BILLING_SERVER_GRACE_MS
+        ) {
+          return res.json(
+            linklyfeSubscriptionResponse(entitlement, { stale: true })
+          );
+        }
+
+        if (linklyfeIsTerminalPurchaseLookupError(error)) {
+          const inactive = {
+            ...entitlement,
+            active: false,
+            state: "PURCHASE_NOT_ACTIVE",
+            lastVerifiedAt: new Date().toISOString()
+          };
+
+          await entitlementRef.set(
+            {
+              active: false,
+              state: inactive.state,
+              lastVerifiedAt: inactive.lastVerifiedAt,
+              updatedAt: FieldValue.serverTimestamp()
+            },
+            { merge: true }
+          );
+
+          return res.json(linklyfeSubscriptionResponse(inactive));
+        }
+
+        throw error;
+      }
+    } catch (error) {
+      return sendLinklyfeSubscriptionError(req, res, error);
+    }
+  }
+);
+
 // --------------------------------------------------
 // PHASE 4 — FINAL PUBLIC ERROR BOUNDARY
 // --------------------------------------------------
@@ -2524,6 +3358,13 @@ app.listen(PORT, () => {
     monitoringPhase: "phase6",
     appCheckEnforcementMode: APP_CHECK_ENFORCEMENT_MODE,
     runwareRecipeRemixConfigured: Boolean(RUNWARE_API_KEY),
-    runwareRecipeRemixModel: RUNWARE_RECIPE_REMIX_MODEL
+    runwareRecipeRemixModel: RUNWARE_RECIPE_REMIX_MODEL,
+    subscriptionVerificationEnabled: true,
+    billingAppCheckRequired: LINKLYFE_BILLING_REQUIRE_APP_CHECK,
+    googlePlayCredentialsConfigured: Boolean(
+      process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON ||
+      process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_BASE64 ||
+      process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_FILE
+    )
   }));
 });
