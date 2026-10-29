@@ -167,6 +167,16 @@ const LINKLYFE_SUBSCRIPTION_ENTITLEMENT_COLLECTION =
   "linklyfe_subscription_entitlements_v1";
 const LINKLYFE_SUBSCRIPTION_TOKEN_COLLECTION =
   "linklyfe_subscription_purchase_tokens_v1";
+// Version 2.0 first-open access: a backend-owned, per-Firebase-UID trial.
+// Configure LINKLYFE_2_LAUNCH_AT to the fixed 2.0 public-release timestamp
+// BEFORE publishing 2.0. Never advance it later; doing so changes eligibility.
+// Older Firebase identities: 14 days on first 2.0 open. New: 7 days.
+const LINKLYFE_2_LAUNCH_AT = String(process.env.LINKLYFE_2_LAUNCH_AT || "").trim();
+const LINKLYFE_TRIAL_COLLECTION = "linklyfe_free_access_trials_v1";
+const LINKLYFE_TRIAL_GATE_MODE = ["off", "monitor", "enforce"].includes(
+  String(process.env.LINKLYFE_TRIAL_GATE_MODE || "off").trim().toLowerCase()
+) ? String(process.env.LINKLYFE_TRIAL_GATE_MODE || "off").trim().toLowerCase() : "off";
+const LINKLYFE_TRIAL_DAY_MS = 24 * 60 * 60 * 1000;
 const LINKLYFE_ANDROID_PUBLISHER_SCOPE =
   "https://www.googleapis.com/auth/androidpublisher";
 const LINKLYFE_GOOGLE_OAUTH_TOKEN_URL =
@@ -381,7 +391,8 @@ async function requireFirebaseIdToken(req, res, next) {
     req.linklyfeAuth = {
       uid: decodedToken.uid,
       provider: decodedToken.firebase?.sign_in_provider || "unknown",
-      isAnonymous: decodedToken.firebase?.sign_in_provider === "anonymous"
+      isAnonymous: decodedToken.firebase?.sign_in_provider === "anonymous",
+      isAdmin: decodedToken.linklyfeAdmin === true
     };
     return next();
   } catch (_) {
@@ -678,6 +689,11 @@ const phase3SubscriptionStatusLimits = phase3UserEndpointLimits(
   20,
   80
 );
+
+const phase3TrialStatusLimits = phase3UserEndpointLimits(
+  "trial-status", 15, 60
+);
+
 
 function isJsonObject(value) {
   return value !== null &&
@@ -2295,6 +2311,7 @@ app.post(
   verifyLinklyfeAppCheck,
   phase3UserGate,
   ...phase3PlaceAutosuggestLimits,
+  requireLinklyfeTrialOrSubscription,
   async (req, res) => {
   try {
     const bodyShapeError = validateAllowedKeys(
@@ -2364,6 +2381,7 @@ app.post(
   verifyLinklyfeAppCheck,
   phase3UserGate,
   ...phase3RouteComputeLimits,
+  requireLinklyfeTrialOrSubscription,
   async (req, res) => {
   try {
     const bodyShapeError = validateAllowedKeys(
@@ -2482,6 +2500,7 @@ app.post(
   verifyLinklyfeAppCheck,
   phase3UserGate,
   ...phase3ExploreImageLimits,
+  requireLinklyfeTrialOrSubscription,
   async (req, res) => {
     try {
       const validationError = validateExploreImageBody(req.body || {});
@@ -2567,6 +2586,7 @@ app.post(
   verifyLinklyfeAppCheck,
   phase3UserGate,
   ...phase3CustomFlowImageLimits,
+  requireLinklyfeTrialOrSubscription,
   async (req, res) => {
     try {
       const validationError = validateCustomFlowImageBody(req.body || {});
@@ -2640,6 +2660,7 @@ app.post(
   verifyLinklyfeAppCheck,
   phase3UserGate,
   ...phase3TripImageLimits,
+  requireLinklyfeTrialOrSubscription,
   async (req, res) => {
     try {
       const validationError = validateTripImageBody(req.body || {});
@@ -2724,6 +2745,7 @@ app.post(
   verifyLinklyfeAppCheck,
   phase3UserGate,
   ...phase3RecipeRemixImageLimits,
+  requireLinklyfeTrialOrSubscription,
   async (req, res) => {
     try {
       const validationError = validateRecipeRemixImagesBody(req.body || {});
@@ -2859,6 +2881,7 @@ app.post(
   verifyLinklyfeAppCheck,
   phase3UserGate,
   ...phase3GenerateLimits,
+  requireLinklyfeTrialOrSubscription,
   async (req, res) => {
   try {
     const validationError = validateSimplePromptBody(
@@ -2899,6 +2922,7 @@ app.post(
   verifyLinklyfeAppCheck,
   phase3UserGate,
   ...phase3AgentSmithLimits,
+  requireLinklyfeTrialOrSubscription,
   async (req, res) => {
   try {
     const validationError = validateSimplePromptBody(
@@ -3002,6 +3026,7 @@ app.post(
   verifyLinklyfeAppCheck,
   phase3UserGate,
   ...phase3EvidenceSearchLimits,
+  requireLinklyfeTrialOrSubscription,
   async (req, res) => {
   try {
     const bodyShapeError = validateAllowedKeys(
@@ -3109,6 +3134,135 @@ app.post(
   }
 });
 
+
+// --------------------------------------------------
+// LINKLYFE 2.0 — FIRST-OPEN FREE ACCESS (7/14 DAYS)
+// --------------------------------------------------
+function linklyfeTrialCutoffMs() {
+  const cutoffMs = Date.parse(LINKLYFE_2_LAUNCH_AT);
+  if (!LINKLYFE_2_LAUNCH_AT || !Number.isFinite(cutoffMs)) {
+    throw new Error("LINKLYFE_2_LAUNCH_AT is not configured with an ISO-8601 timestamp.");
+  }
+  return cutoffMs;
+}
+
+function linklyfeTrialActiveNow(trial) {
+  const endMs = Date.parse(trial?.endsAt || "");
+  return Boolean(trial?.startedAt) && Number.isFinite(endMs) && endMs > Date.now();
+}
+
+function linklyfeTrialPublicResponse(trial) {
+  return {
+    trialActive: linklyfeTrialActiveNow(trial),
+    trialDays: trial?.days || 0,
+    trialIsLegacy: trial?.legacy === true,
+    trialStartedAt: trial?.startedAt || null,
+    trialEndsAt: trial?.endsAt || null
+  };
+}
+
+// Only /access/status enrolls the UID. Old 1.x traffic never starts the timer.
+async function linklyfeGetOrStartTrialOnFirstOpen(uid) {
+  const ref = getFirestore().collection(LINKLYFE_TRIAL_COLLECTION).doc(uid);
+  const existing = await ref.get();
+  if (existing.exists) return existing.data() || {};
+
+  // Firebase user creation time is controlled by Firebase Auth, not the phone.
+  // Existing anonymous accounts also qualify when their Firebase UID survives upgrade.
+  const cutoffMs = linklyfeTrialCutoffMs();
+  const userRecord = await getAuth().getUser(uid);
+  const createdAtMs = Date.parse(userRecord?.metadata?.creationTime || "");
+  if (!Number.isFinite(createdAtMs)) {
+    throw new Error("Firebase account creation timestamp unavailable.");
+  }
+  const legacy = createdAtMs < cutoffMs;
+  const days = legacy ? 14 : 7;
+
+  return getFirestore().runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (snap.exists) return snap.data() || {};
+    const startMs = Date.now();
+    const record = {
+      ownerFirebaseUid: uid,
+      legacy,
+      days,
+      startedAt: new Date(startMs).toISOString(),
+      endsAt: new Date(startMs + days * LINKLYFE_TRIAL_DAY_MS).toISOString(),
+      releaseCutoffAt: LINKLYFE_2_LAUNCH_AT,
+      createdAt: FieldValue.serverTimestamp()
+    };
+    tx.create(ref, record);
+    return record;
+  });
+}
+
+// This route is explicitly called on the FIRST OPEN of 2.0 and whenever the
+// Firebase identity changes. It works for Firebase anonymous guest identities.
+app.post(
+  "/access/status",
+  phase3NetworkGate,
+  requireFirebaseIdToken,
+  verifyLinklyfeAppCheck,
+  phase3UserGate,
+  ...phase3TrialStatusLimits,
+  async (req, res) => {
+    try {
+      if (Object.keys(req.body || {}).length) {
+        return respondPhase3ValidationError(res, "Request body must be empty.");
+      }
+      const trial = await linklyfeGetOrStartTrialOnFirstOpen(req.linklyfeAuth.uid);
+      return res.json(linklyfeTrialPublicResponse(trial));
+    } catch (error) {
+      logBackendError(req, "trial_status_failed", error);
+      return res.status(503).json({
+        error: true,
+        code: "trial_temporarily_unavailable",
+        message: "Free access status is temporarily unavailable."
+      });
+    }
+  }
+);
+
+// Release switch: OFF by default, so older 1.0 builds stay functional.
+// MONITOR reports would-be denials. ENFORCE rejects premium route traffic
+// without a current free trial or active paid entitlement. Do not enable
+// ENFORCE until older app versions have been migrated or deliberately retired.
+async function requireLinklyfeTrialOrSubscription(req, res, next) {
+  if (LINKLYFE_TRIAL_GATE_MODE === "off") return next();
+  try {
+    if (req.linklyfeAuth?.isAdmin === true) return next();
+    const uid = String(req.linklyfeAuth?.uid || "");
+    if (!uid) return res.status(401).json({ error: true, code: "missing_auth" });
+    const db = getFirestore();
+    const [trialSnap, paidSnap] = await Promise.all([
+      db.collection(LINKLYFE_TRIAL_COLLECTION).doc(uid).get(),
+      db.collection(LINKLYFE_SUBSCRIPTION_ENTITLEMENT_COLLECTION).doc(uid).get()
+    ]);
+    const trial = trialSnap.exists ? trialSnap.data() : null;
+    const paid = paidSnap.exists ? paidSnap.data() : null;
+    if (linklyfeTrialActiveNow(trial) || linklyfeSubscriptionEntitlementActiveNow(paid)) {
+      return next();
+    }
+    logMonitoringEvent(req, "premium_access_required", {
+      enforcementMode: LINKLYFE_TRIAL_GATE_MODE,
+      trialStarted: Boolean(trial)
+    });
+    if (LINKLYFE_TRIAL_GATE_MODE === "monitor") return next();
+    return res.status(403).json({
+      error: true,
+      code: "subscription_required",
+      message: "Your free access has ended. Choose a subscription to continue."
+    });
+  } catch (error) {
+    logBackendError(req, "premium_access_check_failed", error);
+    if (LINKLYFE_TRIAL_GATE_MODE === "monitor") return next();
+    return res.status(503).json({
+      error: true,
+      code: "access_check_unavailable",
+      message: "We couldn't verify access. Please try again shortly."
+    });
+  }
+}
 
 // --------------------------------------------------
 // LINKLYFE UNLIMITED — SERVER-AUTHORITATIVE SUBSCRIPTION ROUTES
