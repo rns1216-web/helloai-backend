@@ -673,6 +673,12 @@ const phase3PlaceAutosuggestLimits = phase3UserEndpointLimits(
   45,
   150
 );
+
+const phase3TravelRecommendationsLimits = phase3UserEndpointLimits(
+  "travel-recommendations",
+  6,
+  18
+);
 const phase3RouteComputeLimits = phase3UserEndpointLimits(
   "route-compute",
   8,
@@ -2371,6 +2377,107 @@ app.post(
     return res.status(502).json({ error: "Place suggestions are temporarily unavailable." });
   }
 });
+
+// --------------------------------------------------
+// P29.1 MOMENTS TRAVEL SHORTLIST — GOOGLE PLACES TEXT SEARCH
+// Real named places in the result UI; no room inventory or fare claims.
+// Same user identity, App Check, entitlement and rate-limit gates as Route Planner.
+// --------------------------------------------------
+async function linklyfeTravelTextSearch(textQuery) {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), 10000);
+  try {
+    const response = await fetch("https://places.googleapis.com/v1/places:searchText", {
+      method: "POST",
+      signal: abort.signal,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.googleMapsUri,places.primaryType"
+      },
+      body: JSON.stringify({ textQuery, pageSize: 8, languageCode: "en" })
+    });
+    if (!response.ok) throw new Error(`Google Places Text Search status ${response.status}`);
+    const json = await response.json();
+    return (Array.isArray(json.places) ? json.places : [])
+      .filter(place => place?.id && place?.displayName?.text)
+      .map(place => ({
+        placeId: String(place.id),
+        name: String(place.displayName.text).slice(0, 140),
+        address: String(place.formattedAddress || "").slice(0, 240),
+        rating: typeof place.rating === "number" ? place.rating : null,
+        reviewCount: Number.isInteger(place.userRatingCount) ? place.userRatingCount : null,
+        mapsUrl: /^(https:\/\/www\.google\.com\/maps\/|https:\/\/maps\.google\.com\/)/.test(String(place.googleMapsUri || ""))
+          ? place.googleMapsUri : "",
+        type: String(place.primaryType || "")
+      }))
+      .slice(0, 3);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+app.post(
+  "/travel_recommendations",
+  phase3NetworkGate,
+  requireFirebaseIdToken,
+  verifyLinklyfeAppCheck,
+  phase3UserGate,
+  ...phase3TravelRecommendationsLimits,
+  requireLinklyfeTrialOrSubscription,
+  async (req, res) => {
+    try {
+      const shapeError = validateAllowedKeys(req.body, [
+        "destination", "method", "accommodation", "stayPreference"
+      ]);
+      if (shapeError) return respondPhase3ValidationError(res, shapeError);
+      for (const [key, limit, required] of [
+        ["destination", 140, true], ["method", 60, false],
+        ["accommodation", 60, false], ["stayPreference", 60, false]
+      ]) {
+        const reason = validateStringValue(req.body[key], {
+          fieldName: key, required, minLength: required ? 2 : 0, maxLength: limit
+        });
+        if (reason) return respondPhase3ValidationError(res, reason);
+      }
+      if (!GOOGLE_PLACES_API_KEY) {
+        return res.status(503).json({ error: "Travel recommendations are unavailable." });
+      }
+      const destination = normalizePlaceQuery(req.body.destination);
+      // Only accept a short, known category from the user's mini-app selection;
+      // do not let arbitrary input become a third-party search instruction.
+      const requestedMethod = String(req.body.method || "").toLowerCase();
+      const method = requestedMethod.includes("drive") ? "Drive"
+        : requestedMethod.includes("train") ? "Train"
+        : requestedMethod.includes("bus") ? "Bus"
+        : requestedMethod.includes("flight") ? "Flight" : "Flexible";
+      const stayInput = String(req.body.accommodation || "").toLowerCase();
+      const stayType = stayInput.includes("rental") ? "vacation rentals"
+        : stayInput.includes("resort") ? "resorts" : "hotels";
+      const prefInput = String(req.body.stayPreference || "").toLowerCase();
+      const comfort = prefInput.includes("upscale") ? "upscale "
+        : prefInput.includes("budget") ? "budget "
+        : prefInput.includes("mid") ? "mid range " : "";
+      const transportKind = {
+        Drive: "parking garages", Train: "train stations",
+        Bus: "bus stations", Flight: "airports",
+        Flexible: "public transport stations"
+      }[method];
+      const [stays, transport] = await Promise.all([
+        linklyfeTravelTextSearch(`${comfort}${stayType} in ${destination}`),
+        linklyfeTravelTextSearch(`${transportKind} in ${destination}`)
+      ]);
+      return res.json({
+        provider: "google_places_text_search", destination, method,
+        // Real place suggestions, NOT booked rooms, verified prices or flight tickets.
+        stays, transport
+      });
+    } catch (error) {
+      logBackendError(req, "travel_recommendations_failed", error);
+      return res.status(502).json({ error: "Travel recommendations are temporarily unavailable." });
+    }
+  }
+);
 
 // --------------------------------------------------
 // GOOGLE ROUTES — DISTANCE ROUTE PLANNER
